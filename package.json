@@ -1,0 +1,64 @@
+{
+  "name": "@molesignal/browser-rum",
+  "version": "0.1.0",
+  "description": "MoleSignal browser real user monitoring SDK",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "npm run build:js && npm run build:types",
+    "build:js": "tsup src/index.ts --format esm,cjs --clean",
+    "build:types": "tsc --emitDeclarationOnly --declaration --noEmit false --outDir dist",
+    "test": "npm run build && node --test && npm run test:types",
+    "test:types": "tsc --ignoreConfig --noEmit --strict --skipLibCheck false --target ES2020 --module NodeNext --moduleResolution NodeNext --lib ES2020,DOM test/fixtures/consumer.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm run test",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "molesignal",
+    "rum",
+    "real-user-monitoring",
+    "observability",
+    "web-vitals",
+    "session-replay"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/molesignal/browser-rum.git"
+  },
+  "bugs": {
+    "url": "https://github.com/molesignal/browser-rum/issues"
+  },
+  "homepage": "https://github.com/molesignal/browser-rum#readme",
+  "author": {
+    "name": "MoleSignal",
+    "email": "opensource@molesignal.io"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2"
+  }
+}

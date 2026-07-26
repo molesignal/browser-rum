@@ -1,0 +1,197 @@
+# MoleSignal Browser RUM
+
+The official browser Real User Monitoring SDK for MoleSignal. It reports
+sessions, page views, user actions, frontend errors, Web Vitals, network
+resources, W3C trace correlation, and an optional privacy-aware replay timeline.
+
+[简体中文](README.zh-CN.md)
+
+## Install
+
+```bash
+npm install @molesignal/browser-rum
+```
+
+## Quick start
+
+```ts
+import { initRum } from '@molesignal/browser-rum';
+
+const rum = initRum({
+  applicationId: 'checkout-web',
+  clientToken: 'ms_your_ingestion_token',
+  site: 'https://molesignal.example.com',
+  service: 'web-frontend',
+  env: 'production',
+  version: 'v1.4.0',
+  sessionSampleRate: 100,
+  trackUserInteractions: true,
+});
+```
+
+This is the same API used by MoleSignal's **Data Sources → Frontend RUM**
+setup guide. The SDK writes to:
+
+- `POST /api/v1/rum/v1/sessions`
+- `POST /api/v1/rum/v1/actions`
+- `POST /api/v1/rum/v1/errors`
+- `POST /api/v1/rum/v1/replay`
+
+All requests use `Authorization: Bearer <clientToken>`.
+
+## Identify users and add application context
+
+Pass the initial user during initialization when possible, so the first session
+row is associated with the correct user.
+
+```ts
+const rum = initRum({
+  applicationId: 'checkout-web',
+  clientToken: 'ms_your_ingestion_token',
+  site: 'https://molesignal.example.com',
+  user: {
+    id: currentUser.id,
+    plan: currentUser.plan,
+  },
+  globalContext: {
+    region: 'eu-west-1',
+  },
+});
+
+rum.setUser({ id: 'user-42', plan: 'enterprise' });
+rum.setGlobalContextProperty('feature_flags', ['new-checkout']);
+```
+
+When no user is provided, the SDK creates a stable anonymous ID in
+`localStorage`. Set `trackAnonymousUser: false` to disable this.
+
+## Manual instrumentation
+
+```ts
+rum.addAction('Checkout submitted', {
+  cart_size: 3,
+  payment_method: 'card',
+});
+
+try {
+  await submitOrder();
+} catch (error) {
+  rum.addError(error, { component: 'CheckoutForm' });
+}
+
+// Use this when trackViewsManually is true.
+rum.startView('Order confirmation');
+
+await rum.flush();
+```
+
+The package is safe to import and initialize during SSR. Browser
+instrumentation starts only when `window`, `document`, and `navigator` exist.
+
+## Session replay timeline
+
+Replay is disabled by default. Enable sampled replay at initialization or start
+it for the current sampled session:
+
+```ts
+const rum = initRum({
+  applicationId: 'checkout-web',
+  clientToken: 'ms_your_ingestion_token',
+  site: 'https://molesignal.example.com',
+  sessionSampleRate: 100,
+  sessionReplaySampleRate: 20,
+});
+
+rum.startSessionReplayRecording();
+rum.stopSessionReplayRecording();
+```
+
+The current MoleSignal replay UI is event-timeline based. The SDK records
+navigation, interactions, network calls, and errors; it does not serialize DOM
+content or input values.
+
+## Trace correlation
+
+The fetch and XMLHttpRequest integrations read W3C `traceparent` from the
+outgoing request, response, or a `Server-Timing` metric named `traceparent`.
+The resulting `trace_id` and `parent_span_id` are stored on `rum_actions`, which
+lets MoleSignal connect a browser request to backend traces.
+
+For a cross-origin response, expose the correlation headers:
+
+```http
+Access-Control-Expose-Headers: traceparent, server-timing
+```
+
+By default, response trace context is read only for same-origin requests. Use
+`allowedTracingUrls` to opt additional origins in:
+
+```ts
+allowedTracingUrls: [
+  'https://api.example.com',
+  /^https:\/\/edge-\w+\.example\.com\//,
+]
+```
+
+## Configuration
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `applicationId` | required | Stable RUM application name |
+| `clientToken` | required | MoleSignal Bearer token |
+| `site` | required | MoleSignal origin or `/api`/`/api/v1` base |
+| `service` | `applicationId` | Service stored on actions and errors |
+| `env`, `version` | unset | Deployment dimensions and sourcemap release |
+| `user`, `globalContext` | unset | Initial identity and custom dimensions |
+| `sessionSampleRate` | `100` | Percentage of sessions collected |
+| `sessionReplaySampleRate` | `0` | Percentage of sampled sessions with replay |
+| `trackUserInteractions` | `false` | Capture clicks and form submissions |
+| `trackFrustrations` | interaction setting | Detect rage and dead clicks |
+| `trackResources` | `true` | Capture fetch, XHR, and resource timing |
+| `trackLongTasks` | `true` | Capture browser long tasks |
+| `trackWebVitals` | `true` | Capture LCP, FID, CLS, TTFB, and INP context |
+| `trackViewsManually` | `false` | Disable automatic History API view tracking |
+| `trackConsoleErrors` | `false` | Capture `console.error` in addition to runtime errors |
+| `trackAnonymousUser` | `true` | Create a persistent anonymous user ID |
+| `trackUrlQueryString` | `false` | Preserve query strings in reported URLs |
+| `defaultPrivacyLevel` | `mask` | Allow or mask interaction labels/raw stacks |
+| `excludedUrls` | `[]` | String, RegExp, or callback URL exclusions |
+| `allowedTracingUrls` | same origin | Origins allowed to contribute trace context |
+| `beforeSend` | unset | Inspect, modify, or return `false` to drop an event |
+| `onError` | unset | Receive SDK transport/configuration diagnostics |
+| `transport` | browser fetch | Route uploads through a custom proxy transport |
+
+Batch sizes, flush intervals, queue limits, and session timeouts are also
+configurable and fully typed through `RumInitConfiguration`.
+
+## Privacy and token security
+
+- URL query strings and fragments are removed by default.
+- Keys such as `password`, `token`, `authorization`, `cookie`, and `api_key`
+  are redacted recursively.
+- Interaction text, ARIA labels, raw error stacks, DOM contents, and input
+  values are not collected with the default `mask` privacy level.
+- `clientToken` is shipped to the browser and must be treated as public.
+  Never reuse an owner/admin or personal token. Use a dedicated,
+  ingestion-only token when available. If your MoleSignal deployment only has
+  broad role-based tokens, put a same-origin ingestion proxy in front of the
+  four RUM endpoints.
+
+## Browser support
+
+The distributed bundle targets ES2020 and ships ESM, CommonJS, and TypeScript
+declarations. Optional browser APIs such as `PerformanceObserver`,
+`MutationObserver`, and persistent storage degrade independently when
+unavailable.
+
+## Development
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```
+
+`npm test` verifies the public API, SSR behavior, MoleSignal ingest payloads,
+replay segmentation, privacy redaction, and W3C trace correlation.
+
