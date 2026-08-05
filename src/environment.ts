@@ -45,6 +45,17 @@ export function getAnonymousUserId(config: NormalizedRumConfiguration): string |
   }
 }
 
+export function clearAnonymousUserId(config: NormalizedRumConfiguration): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(
+      `molesignal_rum_anonymous_${storageKey(config.applicationId)}`,
+    );
+  } catch {
+    // Storage can be denied in private contexts.
+  }
+}
+
 function browserName(userAgent: string): string | undefined {
   if (/Edg\//.test(userAgent)) return 'Edge';
   if (/OPR\//.test(userAgent)) return 'Opera';

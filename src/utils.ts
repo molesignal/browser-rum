@@ -1,7 +1,11 @@
 import type { RumContext, UrlMatcher } from './types.js';
 
 export const SDK_NAME = '@molesignal/browser-rum';
-export const SDK_VERSION = '0.1.0';
+declare const __MOLESIGNAL_RUM_VERSION__: string | undefined;
+export const SDK_VERSION =
+  typeof __MOLESIGNAL_RUM_VERSION__ === 'string'
+    ? __MOLESIGNAL_RUM_VERSION__
+    : '0.0.0-dev';
 
 const SENSITIVE_KEY =
   /(?:password|passwd|secret|token|authorization|cookie|set-cookie|api[-_]?key|credit[-_]?card|cvv)/i;
@@ -140,6 +144,10 @@ export interface TraceContext {
   parentSpanId: string;
 }
 
+export function generateTraceparent(): string {
+  return `00-${randomHex(16)}-${randomHex(8)}-01`;
+}
+
 export function parseTraceparent(value: string | null | undefined): TraceContext | undefined {
   if (!value) return undefined;
   const match = value
@@ -207,4 +215,18 @@ function nodeDescription(node: Node): string {
     return `<${node.tagName.toLowerCase()}>`;
   }
   return `[${node.nodeName}]`;
+}
+
+function randomHex(byteCount: number): string {
+  const bytes = new Uint8Array(byteCount);
+  const cryptoObject = globalThis.crypto;
+  if (cryptoObject && typeof cryptoObject.getRandomValues === 'function') {
+    cryptoObject.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  if (bytes.every((value) => value === 0)) bytes[bytes.length - 1] = 1;
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }

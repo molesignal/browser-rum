@@ -23,9 +23,12 @@
   "sideEffects": false,
   "scripts": {
     "build": "npm run build:js && npm run build:types",
-    "build:js": "tsup src/index.ts --format esm,cjs --clean",
+    "build:js": "tsup --config tsup.config.mjs",
     "build:types": "tsc --emitDeclarationOnly --declaration --noEmit false --outDir dist",
-    "test": "npm run build && node --test && npm run test:types",
+    "test": "npm run build && npm run test:unit && npm run test:types",
+    "test:unit": "node --test test/public-api.test.mjs",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:install": "playwright install chromium firefox webkit",
     "test:types": "tsc --ignoreConfig --noEmit --strict --skipLibCheck false --target ES2020 --module NodeNext --moduleResolution NodeNext --lib ES2020,DOM test/fixtures/consumer.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run test",
@@ -58,10 +61,15 @@
     "email": "opensource@molesignal.io"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "tsup": "^8.5.1",
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@rrweb/record": "^2.1.1"
+    "@rrweb/record": "^2.1.1",
+    "web-vitals": "6.0.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }

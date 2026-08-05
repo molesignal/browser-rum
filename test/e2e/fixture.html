@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MoleSignal browser RUM E2E</title>
+    <script type="importmap">
+      {
+        "imports": {
+          "@rrweb/record": "/node_modules/@rrweb/record/dist/record.js",
+          "web-vitals": "/node_modules/web-vitals/dist/web-vitals.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main>
+      <button
+        id="customer-alice@example.com"
+        data-testid="account-alice@example.com"
+        data-molesignal-name="Alice private account"
+      >
+        Checkout
+      </button>
+      <input id="password" value="super-secret-input-value" />
+      <div id="mutation-target">Initial</div>
+    </main>
+    <script type="module">
+      import { initRum } from '/dist/index.js';
+
+      const clientToken =
+        'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF';
+
+      window.bootRum = (overrides = {}) => {
+        window.rum = initRum({
+          applicationId: 'browser-e2e',
+          clientToken,
+          site: window.location.origin,
+          service: 'browser-e2e-web',
+          version: '1.0.0-e2e',
+          trackViewsManually: true,
+          trackUserInteractions: true,
+          trackFrustrations: false,
+          trackResources: true,
+          trackLongTasks: false,
+          trackWebVitals: false,
+          flushInterval: 250,
+          replayFlushInterval: 250,
+          retryBaseDelay: 250,
+          retryMaxDelay: 1_000,
+          ...overrides,
+        });
+        return true;
+      };
+      window.fixtureReady = true;
+    </script>
+  </body>
+</html>

@@ -19,21 +19,30 @@ export function instrumentInteractions(
 ): Cleanup {
   const clickSamples: ClickSample[] = [];
   const deadClickTimers = new Set<ReturnType<typeof globalThis.setTimeout>>();
+  let mutationObserver: MutationObserver | undefined;
 
-  const mutationObserver =
-    typeof MutationObserver !== 'undefined'
-      ? new MutationObserver(() => {
-          hooks.markChange();
-        })
-      : undefined;
-  if (mutationObserver && document.documentElement) {
+  const startMutationWatch = (): void => {
+    if (
+      mutationObserver ||
+      typeof MutationObserver === 'undefined' ||
+      !document.documentElement
+    ) {
+      return;
+    }
+    mutationObserver = new MutationObserver(() => hooks.markChange());
     mutationObserver.observe(document.documentElement, {
       subtree: true,
       childList: true,
       attributes: true,
       characterData: true,
     });
-  }
+  };
+
+  const stopMutationWatchIfIdle = (): void => {
+    if (deadClickTimers.size > 0) return;
+    mutationObserver?.disconnect();
+    mutationObserver = undefined;
+  };
 
   const onClick = (event: MouseEvent): void => {
     if (event.button !== 0 || !(event.target instanceof Element)) return;
@@ -41,7 +50,11 @@ export function instrumentInteractions(
     if (!element) return;
     hooks.markActivity();
 
-    const selector = elementSelector(element, options.actionNameAttribute);
+    const selector = elementSelector(
+      element,
+      options.actionNameAttribute,
+      options.privacyLevel,
+    );
     const name = interactionName(
       element,
       selector,
@@ -85,6 +98,7 @@ export function instrumentInteractions(
     }
 
     if (!canBeDeadClick(element)) return;
+    startMutationWatch();
     const changeId = hooks.getChangeId();
     const timer = globalThis.setTimeout(() => {
       deadClickTimers.delete(timer);
@@ -99,6 +113,7 @@ export function instrumentInteractions(
           context: { ...context, wait_ms: 1_000 },
         });
       }
+      stopMutationWatchIfIdle();
     }, 1_000);
     deadClickTimers.add(timer);
   };
@@ -106,7 +121,11 @@ export function instrumentInteractions(
   const onSubmit = (event: SubmitEvent): void => {
     if (!(event.target instanceof HTMLFormElement)) return;
     hooks.markActivity();
-    const selector = elementSelector(event.target, options.actionNameAttribute);
+    const selector = elementSelector(
+      event.target,
+      options.actionNameAttribute,
+      options.privacyLevel,
+    );
     hooks.recordAction({
       type: 'submit',
       name: `Submit ${selector}`,
@@ -178,8 +197,8 @@ function interactionName(
   actionNameAttribute: string,
 ): string {
   const explicit = element.getAttribute(actionNameAttribute)?.trim();
-  if (explicit) return truncate(explicit, 160);
   if (privacyLevel === 'allow') {
+    if (explicit) return truncate(explicit, 160);
     const label =
       element.getAttribute('aria-label')?.trim() ||
       element.getAttribute('title')?.trim() ||
@@ -189,11 +208,17 @@ function interactionName(
   return `Click ${selector}`;
 }
 
-function elementSelector(element: Element, actionNameAttribute: string): string {
+function elementSelector(
+  element: Element,
+  actionNameAttribute: string,
+  privacyLevel: PrivacyLevel,
+): string {
+  const tag = element.tagName.toLowerCase();
+  if (privacyLevel === 'mask') return structuralSelector(element, tag);
+
   const explicit = element.getAttribute(actionNameAttribute)?.trim();
   if (explicit) return `[${actionNameAttribute}="${escapeSelectorValue(explicit)}"]`;
 
-  const tag = element.tagName.toLowerCase();
   const id = element.id.trim();
   if (id && isStableIdentifier(id)) return `${tag}#${escapeSelectorValue(id)}`;
 
@@ -209,6 +234,10 @@ function elementSelector(element: Element, actionNameAttribute: string): string 
     .join('');
   if (classes) return `${tag}${classes}`;
 
+  return structuralSelector(element, tag);
+}
+
+function structuralSelector(element: Element, tag: string): string {
   const parent = element.parentElement;
   if (!parent) return tag;
   const siblings = Array.from(parent.children).filter(

@@ -22,6 +22,8 @@ export interface RumTransportResponse {
   status: number;
   statusText?: string;
   body?: string;
+  /** Parsed Retry-After delay in milliseconds, when supplied by the server. */
+  retryAfterMs?: number;
 }
 
 /**
@@ -40,6 +42,24 @@ export interface BeforeSendContext {
 export type UrlMatcher = string | RegExp | ((url: string) => boolean);
 
 export type PrivacyLevel = 'mask' | 'allow';
+
+/** Tracking starts only while consent is granted. */
+export type TrackingConsent = 'granted' | 'not-granted';
+
+export type RumQueueDropReason =
+  | 'queue_full'
+  | 'serialization'
+  | 'payload_too_large'
+  | 'rejected';
+
+export interface RumTransportStats {
+  queued: number;
+  sent: number;
+  retried: number;
+  restored: number;
+  dropped: number;
+  droppedByReason: Record<RumQueueDropReason, number>;
+}
 
 /**
  * Session replay is captured as rrweb DOM snapshots and incremental changes.
@@ -66,15 +86,21 @@ export interface RumSessionReplayConfiguration {
 export interface RumInitConfiguration {
   /** Stable application identifier shown in MoleSignal RUM views. */
   applicationId: string;
-  /** MoleSignal API token used as an Authorization Bearer token. */
+  /** Application-bound `msrum_<16>_<32>` token used as a Bearer token. */
   clientToken: string;
   /** MoleSignal origin, for example https://molesignal.example.com. */
   site: string;
   service?: string;
   env?: string;
+  /** Deployment release used for Source Map lookup. */
   version?: string;
+  /** Optional build debug ID used to disambiguate Source Maps for this release. */
+  debugId?: string;
   user?: RumUser;
   globalContext?: RumContext;
+
+  /** Defaults to granted for backwards compatibility. */
+  trackingConsent?: TrackingConsent;
 
   /** Percentage in the inclusive 0..100 range. Defaults to 100. */
   sessionSampleRate?: number;
@@ -104,6 +130,12 @@ export interface RumInitConfiguration {
   replayFlushInterval?: number;
   replayBatchSize?: number;
   maxQueueSize?: number;
+  /** Persist unsent telemetry in IndexedDB. Defaults to true. */
+  enablePersistentQueue?: boolean;
+  /** Initial retry delay in milliseconds. Defaults to 1 second. */
+  retryBaseDelay?: number;
+  /** Maximum retry delay in milliseconds. Defaults to 60 seconds. */
+  retryMaxDelay?: number;
   sessionInactivityTimeout?: number;
   maxSessionDuration?: number;
 
@@ -138,7 +170,11 @@ export interface RumClient {
   startSessionReplayRecording(): void;
   stopSessionReplayRecording(): void;
 
+  setTrackingConsent(consent: TrackingConsent): void;
+  getTrackingConsent(): TrackingConsent;
+
   getInternalContext(): RumInternalContext;
+  getTransportStats(): RumTransportStats;
   flush(): Promise<void>;
   stop(): Promise<void>;
 }

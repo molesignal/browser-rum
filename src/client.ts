@@ -1,5 +1,9 @@
 import type { NormalizedRumConfiguration } from './config.js';
-import { getAnonymousUserId, readBrowserEnvironment } from './environment.js';
+import {
+  clearAnonymousUserId,
+  getAnonymousUserId,
+  readBrowserEnvironment,
+} from './environment.js';
 import { describeError } from './instrumentation/errors.js';
 import { instrumentErrors } from './instrumentation/errors.js';
 import { instrumentInteractions } from './instrumentation/interactions.js';
@@ -22,7 +26,9 @@ import type {
   RumContext,
   RumEventKind,
   RumInternalContext,
+  RumTransportStats,
   RumUser,
+  TrackingConsent,
 } from './types.js';
 import {
   fnv1a,
@@ -39,13 +45,15 @@ import {
 
 export class BrowserRumClient implements RumClient {
   private readonly browser = isBrowserEnvironment();
-  private readonly sessionManager: SessionManager;
-  private readonly eventTransport: EventTransport;
-  private readonly replayRecorder: ReplayRecorder;
+  private sessionManager?: SessionManager;
+  private eventTransport?: EventTransport;
+  private replayRecorder?: ReplayRecorder;
   private readonly browserEnvironment: RumContext;
-  private readonly anonymousUserId?: string;
+  private anonymousUserId?: string;
   private user?: RumUser;
   private globalContext: RumContext;
+  private trackingConsent: TrackingConsent;
+  private consentTransition: Promise<void> = Promise.resolve();
   private readonly cleanups: Cleanup[] = [];
   private performanceInstrumentation?: PerformanceInstrumentation;
   private currentViewUrl = '';
@@ -59,22 +67,12 @@ export class BrowserRumClient implements RumClient {
   constructor(private readonly config: NormalizedRumConfiguration) {
     this.user = config.user ? ({ ...config.user } as RumUser) : undefined;
     this.globalContext = { ...config.globalContext };
-    this.sessionManager = new SessionManager(config);
-    this.eventTransport = new EventTransport(config, (sessionId) =>
-      this.sessionManager.nextReplaySequence(sessionId),
-    );
-    this.replayRecorder = new ReplayRecorder(config, (sessionId, event) => {
-      const prepared = this.applyReplayBeforeSend(event);
-      if (prepared) this.eventTransport.enqueueReplay(sessionId, prepared);
-    });
+    this.trackingConsent = config.trackingConsent;
     this.browserEnvironment = this.browser
       ? (readBrowserEnvironment() as RumContext)
       : {};
-    this.anonymousUserId = this.browser
-      ? getAnonymousUserId(config)
-      : undefined;
 
-    if (this.browser) this.start();
+    if (this.browser && this.trackingConsent === 'granted') this.activate();
   }
 
   setUser(user: RumUser): void {
@@ -82,10 +80,12 @@ export class BrowserRumClient implements RumClient {
       throw new TypeError('MoleSignal RUM user.id must be a non-empty string');
     }
     this.user = { ...sanitizeContext(user), id: user.id.trim() } as RumUser;
+    this.markSessionDirty();
   }
 
   clearUser(): void {
     this.user = undefined;
+    this.markSessionDirty();
   }
 
   getUser(): RumUser | undefined {
@@ -94,15 +94,18 @@ export class BrowserRumClient implements RumClient {
 
   setGlobalContext(context: RumContext): void {
     this.globalContext = sanitizeContext(context);
+    this.markSessionDirty();
   }
 
   setGlobalContextProperty(key: string, value: unknown): void {
     if (!key.trim()) return;
     this.globalContext[key] = value;
+    this.markSessionDirty();
   }
 
   removeGlobalContextProperty(key: string): void {
     delete this.globalContext[key];
+    this.markSessionDirty();
   }
 
   getGlobalContext(): RumContext {
@@ -110,7 +113,7 @@ export class BrowserRumClient implements RumClient {
   }
 
   addAction(name: string, context: RumContext = {}): void {
-    if (!name || this.stopped || !this.browser) return;
+    if (!name || !this.canTrack()) return;
     this.recordAction({
       type: 'custom',
       name,
@@ -119,12 +122,12 @@ export class BrowserRumClient implements RumClient {
   }
 
   addError(error: unknown, context: RumContext = {}): void {
-    if (this.stopped || !this.browser) return;
+    if (!this.canTrack()) return;
     this.recordError(error, context, 'manual');
   }
 
   startView(name?: string, context: RumContext = {}): void {
-    if (this.stopped || !isBrowserEnvironment()) return;
+    if (!this.canTrack()) return;
     const url = this.sanitizeUrl(window.location.href);
     const logicalName = name?.trim() || pagePath(url);
 
@@ -145,22 +148,63 @@ export class BrowserRumClient implements RumClient {
   }
 
   startSessionReplayRecording(): void {
-    if (this.stopped || !this.browser) return;
+    if (!this.canTrack()) return;
     this.replayOverride = true;
     this.prepareSession();
   }
 
   stopSessionReplayRecording(): void {
     this.replayOverride = false;
-    this.replayRecorder.stop();
+    this.replayRecorder?.stop();
+  }
+
+  setTrackingConsent(consent: TrackingConsent): void {
+    if (consent !== 'granted' && consent !== 'not-granted') {
+      throw new TypeError(
+        'MoleSignal RUM tracking consent must be "granted" or "not-granted"',
+      );
+    }
+    if (this.stopped || consent === this.trackingConsent) return;
+    this.trackingConsent = consent;
+
+    if (consent === 'not-granted') {
+      const transport = this.eventTransport;
+      const sessionManager = this.sessionManager;
+      this.deactivateInstrumentation();
+      this.eventTransport = undefined;
+      this.sessionManager = undefined;
+      this.replayRecorder = undefined;
+      this.anonymousUserId = undefined;
+      this.replayOverride = undefined;
+      this.recentErrors.clear();
+      sessionManager?.clear();
+      clearAnonymousUserId(this.config);
+      const discard = transport?.discard() ?? Promise.resolve();
+      this.consentTransition = Promise.all([this.consentTransition, discard]).then(
+        () => undefined,
+      );
+      return;
+    }
+
+    this.consentTransition = this.consentTransition.then(() => {
+      if (!this.stopped && this.trackingConsent === 'granted') this.activate();
+    });
+  }
+
+  getTrackingConsent(): TrackingConsent {
+    return this.trackingConsent;
   }
 
   getInternalContext(): RumInternalContext {
-    const session = this.sessionManager.current();
+    const session = this.sessionManager?.current();
     const context: RumInternalContext = {
       application_id: this.config.applicationId,
-      session_id: session.sampled ? session.id : undefined,
-      user_id: this.currentUserId(),
+      session_id:
+        this.trackingConsent === 'granted' && session?.sampled
+          ? session.id
+          : undefined,
+      user_id:
+        this.trackingConsent === 'granted' ? this.currentUserId() : undefined,
       service: this.config.service,
       env: this.config.env,
       version: this.config.version,
@@ -168,31 +212,60 @@ export class BrowserRumClient implements RumClient {
     return compact(context);
   }
 
+  getTransportStats(): RumTransportStats {
+    return this.eventTransport?.getStats() ?? emptyTransportStats();
+  }
+
   async flush(): Promise<void> {
+    if (!this.canTrack()) return;
     this.performanceInstrumentation?.report();
-    await this.eventTransport.flush(false);
+    this.reportCurrentSession();
+    await this.eventTransport?.flush(false);
   }
 
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
+    const transport = this.eventTransport;
+    this.performanceInstrumentation?.report();
+    const session = this.sessionManager?.current();
+    if (session?.sampled) {
+      this.sessionManager?.finish(session.id);
+      this.reportSession(session);
+    }
+    this.deactivateInstrumentation();
+    this.stopped = true;
     this.stopPromise = (async () => {
-      this.replayRecorder.stop();
-      for (const cleanup of this.cleanups.reverse()) {
-        try {
-          cleanup();
-        } catch (error) {
-          reportInternalError(this.config.onError, error, 'RUM cleanup failed');
-        }
-      }
-      this.performanceInstrumentation?.stop();
-      this.stopped = true;
-      await this.eventTransport.stop();
+      await this.consentTransition;
+      await transport?.stop();
     })();
     return this.stopPromise;
   }
 
+  private activate(): void {
+    if (
+      !this.browser ||
+      this.stopped ||
+      this.trackingConsent !== 'granted' ||
+      this.eventTransport
+    ) {
+      return;
+    }
+    const sessionManager = new SessionManager(this.config);
+    const eventTransport = new EventTransport(this.config, (sessionId) =>
+      sessionManager.nextReplaySequence(sessionId),
+    );
+    this.sessionManager = sessionManager;
+    this.eventTransport = eventTransport;
+    this.replayRecorder = new ReplayRecorder(this.config, (sessionId, event) => {
+      const prepared = this.applyReplayBeforeSend(event);
+      if (prepared) this.eventTransport?.enqueueReplay(sessionId, prepared);
+    });
+    this.anonymousUserId = getAnonymousUserId(this.config);
+    this.start();
+  }
+
   private start(): void {
-    this.eventTransport.start();
+    this.eventTransport?.start();
     this.prepareSession();
     if (this.config.sessionSampleRate <= 0) return;
 
@@ -201,6 +274,7 @@ export class BrowserRumClient implements RumClient {
       trackWebVitals: this.config.trackWebVitals,
       trackResources: this.config.trackResources,
       trackLongTasks: this.config.trackLongTasks,
+      onError: this.config.onError,
     });
 
     if (!this.config.trackViewsManually) {
@@ -223,7 +297,19 @@ export class BrowserRumClient implements RumClient {
       );
     }
     this.installLifecycleListeners();
+  }
 
+  private deactivateInstrumentation(): void {
+    this.replayRecorder?.stop();
+    this.performanceInstrumentation?.stop();
+    this.performanceInstrumentation = undefined;
+    for (const cleanup of this.cleanups.splice(0).reverse()) {
+      try {
+        cleanup();
+      } catch (error) {
+        reportInternalError(this.config.onError, error, 'RUM cleanup failed');
+      }
+    }
   }
 
   private instrumentationHooks(): InstrumentationHooks {
@@ -238,35 +324,40 @@ export class BrowserRumClient implements RumClient {
       getChangeId: () => this.changeId,
       currentPage: () => this.currentViewUrl,
       sanitizeUrl: (url) => this.sanitizeUrl(url),
-      isSdkUrl: (url) => this.eventTransport.isSdkUrl(url),
+      isSdkUrl: (url) => this.eventTransport?.isSdkUrl(url) ?? false,
       shouldTrackUrl: (url) => !matchesUrl(url, this.config.excludedUrls),
       shouldReadTrace: (url) => this.shouldReadTrace(url),
     };
   }
 
   private installLifecycleListeners(): void {
-    const flushKeepalive = (): void => {
+    const flushKeepalive = (finishSession: boolean): void => {
+      if (!this.canTrack()) return;
       this.performanceInstrumentation?.report();
-      void this.eventTransport.flush(true);
+      const session = this.sessionManager?.current();
+      if (finishSession && session?.sampled) this.sessionManager?.finish(session.id);
+      this.reportCurrentSession();
+      void this.eventTransport?.flush(true);
     };
+    const onPageHide = (): void => flushKeepalive(true);
     const onVisibilityChange = (): void => {
-      if (document.visibilityState === 'hidden') flushKeepalive();
+      if (document.visibilityState === 'hidden') flushKeepalive(true);
     };
     const onOnline = (): void => {
-      void this.eventTransport.flush(false);
+      void this.eventTransport?.flush(false);
     };
-    window.addEventListener('pagehide', flushKeepalive);
+    window.addEventListener('pagehide', onPageHide);
     window.addEventListener('online', onOnline);
     document.addEventListener('visibilitychange', onVisibilityChange);
     this.cleanups.push(() => {
-      window.removeEventListener('pagehide', flushKeepalive);
+      window.removeEventListener('pagehide', onPageHide);
       window.removeEventListener('online', onOnline);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     });
   }
 
   private recordAction(input: ActionInput): void {
-    if (this.stopped || !this.browser) return;
+    if (!this.canTrack()) return;
     const session = this.prepareSession();
     if (!session?.sampled) return;
     const timestamp = input.timestampMicros ?? nowMicros();
@@ -303,7 +394,14 @@ export class BrowserRumClient implements RumClient {
       service: input.service ?? this.config.service,
       payload,
     });
-    this.enqueue('action', event);
+    if (this.enqueue('action', event)) {
+      const sessionPage = page ? pagePath(page) : undefined;
+      if (input.context?.source === 'web-vitals') {
+        this.sessionManager?.touchPage(session.id, sessionPage);
+      } else {
+        this.sessionManager?.recordAction(session.id, input.type, sessionPage);
+      }
+    }
 
     if (this.isReplayEnabled(session)) {
       this.recordReplay(
@@ -324,13 +422,14 @@ export class BrowserRumClient implements RumClient {
   }
 
   private recordError(error: unknown, context: RumContext = {}, source = 'unknown'): void {
-    if (this.stopped || !this.browser) return;
+    if (!this.canTrack()) return;
     const session = this.prepareSession();
     if (!session?.sampled) return;
     const details = describeError(error);
     const stack = details.stack.map((frame) => ({
       ...frame,
       file: frame.file ? this.sanitizeUrl(frame.file) : undefined,
+      debug_id: this.config.debugId,
     }));
     const signature = [
       details.type,
@@ -368,6 +467,9 @@ export class BrowserRumClient implements RumClient {
       version: this.config.version,
       release: this.config.version,
       service: this.config.service,
+      platform: 'web',
+      runtime: 'browser',
+      debug_id: this.config.debugId,
       error_type: details.type,
       error: compact({
         type: details.type,
@@ -379,7 +481,12 @@ export class BrowserRumClient implements RumClient {
       }),
       context: errorContext,
     });
-    this.enqueue('error', event);
+    if (this.enqueue('error', event)) {
+      this.sessionManager?.recordError(
+        session.id,
+        page ? pagePath(page) : undefined,
+      );
+    }
     this.recordAction({
       type: 'error',
       name: details.message,
@@ -393,40 +500,64 @@ export class BrowserRumClient implements RumClient {
   }
 
   private prepareSession(): RumSession | undefined {
-    if (this.stopped) return undefined;
-    const { session, created } = this.sessionManager.ensure(true);
-    if (created) {
+    if (!this.canTrack() || !this.sessionManager) return undefined;
+    const { session, created, previous } = this.sessionManager.ensure(true);
+    if (previous?.sampled && (!previous.reported || previous.dirty)) {
+      this.reportSession(previous);
+    }
+    if (created || previous) {
       this.replayOverride = undefined;
       this.recentErrors.clear();
     }
-    if (this.isReplayEnabled(session)) this.replayRecorder.start(session.id);
-    else this.replayRecorder.stop();
+    const page = this.currentViewUrl || this.fallbackPage();
+    this.sessionManager.touchPage(session.id, page ? pagePath(page) : undefined);
+    if (this.isReplayEnabled(session)) this.replayRecorder?.start(session.id);
+    else this.replayRecorder?.stop();
     if (session.sampled && !session.reported) this.reportSession(session);
     return session;
   }
 
   private reportSession(session: RumSession): void {
-    const timestamp = session.startedAtMicros;
+    if (!session.sampled || !this.eventTransport) return;
+    const timestamp = nowMicros();
     const page = this.currentViewUrl || this.fallbackPage();
+    const fallbackPage = page ? pagePath(page) : undefined;
+    const endedAtMicros = Math.max(session.startedAtMicros, session.lastActivityMicros);
     const event = compact({
       ...this.commonFields(timestamp, session),
       timestamp,
       session_id: session.id,
       user_id: this.currentUserId(),
-      started_at: timestamp,
-      started_at_micros: timestamp,
+      started_at: session.startedAtMicros,
+      started_at_micros: session.startedAtMicros,
+      ended_at_micros: endedAtMicros,
+      duration_ms: Math.max(
+        0,
+        Math.round((endedAtMicros - session.startedAtMicros) / 1_000),
+      ),
       application: this.config.applicationId,
       app_version: this.config.version,
       environment: this.config.env,
       version: this.config.version,
       service: this.config.service,
-      landing_page: page ? pagePath(page) : undefined,
-      last_page: page ? pagePath(page) : undefined,
+      landing_page: session.landingPage ?? fallbackPage,
+      last_page: session.lastPage ?? fallbackPage,
+      view_count: session.viewCount,
+      action_count: session.actionCount,
+      error_count: session.errorCount,
       user: this.user ? sanitizeContext(this.user) : undefined,
       context: sanitizeContext(this.globalContext),
     });
-    this.enqueue('session', event);
-    this.sessionManager.markReported(session.id);
+    if (this.enqueue('session', event)) {
+      this.sessionManager?.markReported(session.id);
+    }
+  }
+
+  private reportCurrentSession(): void {
+    const session = this.sessionManager?.current();
+    if (session && this.sessionManager?.needsReport(session)) {
+      this.reportSession(session);
+    }
   }
 
   private commonFields(timestamp: number, session: RumSession): RumContext {
@@ -450,15 +581,18 @@ export class BrowserRumClient implements RumClient {
     });
   }
 
-  private enqueue(kind: Exclude<RumEventKind, 'replay'>, event: RumContext): void {
+  private enqueue(
+    kind: Exclude<RumEventKind, 'replay'>,
+    event: RumContext,
+  ): boolean {
     const prepared = this.applyBeforeSend(kind, event);
-    if (prepared) this.eventTransport.enqueue(kind, prepared);
+    return prepared ? (this.eventTransport?.enqueue(kind, prepared) ?? false) : false;
   }
 
   private recordReplay(session: RumSession, event: RumContext): void {
     if (!this.isReplayEnabled(session)) return;
     const prepared = this.applyBeforeSend('replay', event);
-    if (prepared) this.eventTransport.enqueueReplay(session.id, prepared);
+    if (prepared) this.eventTransport?.enqueueReplay(session.id, prepared);
   }
 
   private applyBeforeSend(kind: RumEventKind, event: RumContext): RumContext | undefined {
@@ -505,6 +639,16 @@ export class BrowserRumClient implements RumClient {
     return this.user?.id ?? this.anonymousUserId;
   }
 
+  private canTrack(): boolean {
+    return (
+      this.browser &&
+      !this.stopped &&
+      this.trackingConsent === 'granted' &&
+      !!this.sessionManager &&
+      !!this.eventTransport
+    );
+  }
+
   private fallbackPage(): string {
     return isBrowserEnvironment() ? this.sanitizeUrl(window.location.href) : '';
   }
@@ -519,6 +663,11 @@ export class BrowserRumClient implements RumClient {
 
   private markChange(): void {
     this.changeId += 1;
+  }
+
+  private markSessionDirty(): void {
+    const session = this.sessionManager?.current();
+    if (session) this.sessionManager?.markDirty(session.id);
   }
 
   private pruneRecentErrors(now: number): void {
@@ -542,4 +691,20 @@ function finite(value: number | undefined): number | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined;
+}
+
+function emptyTransportStats(): RumTransportStats {
+  return {
+    queued: 0,
+    sent: 0,
+    retried: 0,
+    restored: 0,
+    dropped: 0,
+    droppedByReason: {
+      queue_full: 0,
+      serialization: 0,
+      payload_too_large: 0,
+      rejected: 0,
+    },
+  };
 }

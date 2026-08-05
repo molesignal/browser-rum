@@ -1,10 +1,9 @@
-import { record } from '@rrweb/record';
-
 import type { NormalizedRumConfiguration } from '../config.js';
 import type { RumContext } from '../types.js';
 import { reportInternalError, sanitizeUrl } from '../utils.js';
 
 type StopRecording = () => void;
+type RecordFunction = typeof import('@rrweb/record')['record'];
 
 /** Owns one rrweb recorder and guarantees that events never cross sessions. */
 export class ReplayRecorder {
@@ -12,6 +11,7 @@ export class ReplayRecorder {
   private pendingSessionId?: string;
   private stopRecording?: StopRecording;
   private readyListener?: () => void;
+  private generation = 0;
 
   constructor(
     private readonly config: NormalizedRumConfiguration,
@@ -19,7 +19,7 @@ export class ReplayRecorder {
   ) {}
 
   start(sessionId: string): void {
-    if (this.sessionId === sessionId && this.stopRecording) return;
+    if (this.sessionId === sessionId) return;
     this.stop();
     if (!document.documentElement) {
       this.pendingSessionId = sessionId;
@@ -35,6 +35,25 @@ export class ReplayRecorder {
     }
 
     this.sessionId = sessionId;
+    const generation = ++this.generation;
+    void import('@rrweb/record')
+      .then(({ record }) => {
+        if (this.sessionId !== sessionId || this.generation !== generation) return;
+        this.startRecorder(record, sessionId);
+      })
+      .catch((error: unknown) => {
+        if (this.sessionId === sessionId && this.generation === generation) {
+          this.sessionId = undefined;
+        }
+        reportInternalError(
+          this.config.onError,
+          error,
+          'RUM replay recorder failed to load',
+        );
+      });
+  }
+
+  private startRecorder(record: RecordFunction, sessionId: string): void {
     try {
       const stop = record({
         emit: (event) => {
@@ -75,6 +94,7 @@ export class ReplayRecorder {
   }
 
   stop(): void {
+    this.generation += 1;
     if (this.readyListener) {
       document.removeEventListener('DOMContentLoaded', this.readyListener);
       this.readyListener = undefined;

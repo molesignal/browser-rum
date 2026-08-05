@@ -1,5 +1,6 @@
 import {
   durationNow,
+  generateTraceparent,
   parseTraceparent,
   traceparentFromServerTiming,
 } from '../utils.js';
@@ -36,13 +37,23 @@ function instrumentFetch(hooks: InstrumentationHooks): Cleanup {
     }
 
     const method = resolveRequestMethod(input, init);
-    const requestTraceparent = readRequestHeader(input, init, 'traceparent');
+    let requestTraceparent = readRequestHeader(input, init, 'traceparent');
+    let tracedInput = input;
+    let tracedInit = init;
+    if (hooks.shouldReadTrace(url) && !requestTraceparent) {
+      requestTraceparent = generateTraceparent();
+      [tracedInput, tracedInit] = injectFetchTraceparent(
+        input,
+        init,
+        requestTraceparent,
+      );
+    }
     const startedAt = durationNow();
     hooks.markActivity();
     hooks.markChange();
 
     try {
-      const response = await originalFetch.call(this, input, init);
+      const response = await originalFetch.call(this, tracedInput, tracedInit);
       const traceContext = hooks.shouldReadTrace(url)
         ? responseTraceContext(response, requestTraceparent)
         : undefined;
@@ -129,6 +140,15 @@ function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
     metadata.startedAt = durationNow();
     hooks.markActivity();
     hooks.markChange();
+    if (hooks.shouldReadTrace(metadata.url) && !metadata.traceparent) {
+      metadata.traceparent = generateTraceparent();
+      try {
+        originalSetRequestHeader.call(this, 'traceparent', metadata.traceparent);
+      } catch {
+        // The request still proceeds if a browser refuses trace header injection.
+        metadata.traceparent = undefined;
+      }
+    }
     const onLoadEnd = (): void => {
       let responseTraceparent: string | null = null;
       let serverTiming: string | null = null;
@@ -246,6 +266,27 @@ function readRequestHeader(
     // Invalid application headers should be handled by fetch itself.
   }
   return undefined;
+}
+
+function injectFetchTraceparent(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  traceparent: string,
+): [RequestInfo | URL, RequestInit | undefined] {
+  try {
+    const requestHeaders =
+      typeof Request !== 'undefined' && input instanceof Request
+        ? input.headers
+        : undefined;
+    const headers = new Headers(init?.headers ?? requestHeaders);
+    headers.set('traceparent', traceparent);
+    if (typeof Request !== 'undefined' && input instanceof Request && !init) {
+      return [new Request(input, { headers }), undefined];
+    }
+    return [input, { ...init, headers }];
+  } catch {
+    return [input, init];
+  }
 }
 
 function responseTraceContext(

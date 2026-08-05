@@ -1,25 +1,11 @@
+import type { MetricType } from 'web-vitals';
+
 import type { RumContext } from '../types.js';
-import { pagePath } from '../utils.js';
+import { pagePath, reportInternalError } from '../utils.js';
 import type { ActionInput, InstrumentationHooks } from './types.js';
-
-interface LargestContentfulPaintEntry extends PerformanceEntry {
-  renderTime: number;
-  loadTime: number;
-  size: number;
-}
-
-interface LayoutShiftEntry extends PerformanceEntry {
-  value: number;
-  hadRecentInput: boolean;
-}
 
 interface FirstInputEntry extends PerformanceEntry {
   processingStart: number;
-}
-
-interface EventTimingEntry extends PerformanceEntry {
-  duration: number;
-  interactionId: number;
 }
 
 interface ViewMetrics {
@@ -28,6 +14,8 @@ interface ViewMetrics {
   cls?: number;
   ttfbMs?: number;
   inpMs?: number;
+  metricIds: Record<string, string>;
+  navigationType?: string;
 }
 
 export interface PerformanceInstrumentation {
@@ -36,34 +24,69 @@ export interface PerformanceInstrumentation {
   stop(): void;
 }
 
+interface VitalSubscriber {
+  report(metric: MetricType): void;
+  onError?: (error: Error) => void;
+}
+
+const vitalSubscribers = new Set<VitalSubscriber>();
+let vitalCollectorStarted = false;
+
 export function instrumentPerformance(
   hooks: InstrumentationHooks,
   options: {
     trackWebVitals: boolean;
     trackResources: boolean;
     trackLongTasks: boolean;
+    onError?: (error: Error) => void;
   },
 ): PerformanceInstrumentation {
   const observers: PerformanceObserver[] = [];
-  const metrics: ViewMetrics = {};
+  const metricsByPage = new Map<string, ViewMetrics>();
+  const lastReports = new Map<string, string>();
+  const reportTimers = new Map<string, ReturnType<typeof globalThis.setTimeout>>();
   let currentPage: string | undefined;
-  let lastReport = '';
-  let isFirstView = true;
-  let loadTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
-  let removeLoadListener: (() => void) | undefined;
+  let stopped = false;
+  let unsubscribeVitals: (() => void) | undefined;
 
-  const report = (): void => {
-    if (!currentPage || Object.keys(metrics).length === 0) return;
-    const signature = JSON.stringify(metrics);
-    if (signature === lastReport) return;
-    lastReport = signature;
+  const metricsFor = (page: string): ViewMetrics => {
+    let metrics = metricsByPage.get(page);
+    if (!metrics) {
+      metrics = { metricIds: {} };
+      metricsByPage.set(page, metrics);
+      while (metricsByPage.size > 20) {
+        const oldest = metricsByPage.keys().next().value as string | undefined;
+        if (!oldest) break;
+        metricsByPage.delete(oldest);
+        lastReports.delete(oldest);
+      }
+    }
+    return metrics;
+  };
+
+  const reportPage = (page: string): void => {
+    const metrics = metricsByPage.get(page);
+    if (!metrics) return;
+    const values = {
+      lcpMs: metrics.lcpMs,
+      fidMs: metrics.fidMs,
+      cls: metrics.cls,
+      ttfbMs: metrics.ttfbMs,
+      inpMs: metrics.inpMs,
+    };
+    if (Object.values(values).every((value) => value === undefined)) return;
+    const signature = JSON.stringify(values);
+    if (signature === lastReports.get(page)) return;
+    lastReports.set(page, signature);
     const input: ActionInput = {
       type: 'view',
-      name: `View ${pagePath(currentPage)} performance`,
-      url: currentPage,
+      name: `View ${pagePath(page)} performance`,
+      url: page,
       context: {
         source: 'web-vitals',
         inp_ms: metrics.inpMs,
+        metric_ids: metrics.metricIds,
+        navigation_type: metrics.navigationType,
       },
     };
     if (metrics.lcpMs !== undefined) input.lcpMs = metrics.lcpMs;
@@ -73,55 +96,69 @@ export function instrumentPerformance(
     hooks.recordAction(input);
   };
 
+  const scheduleReport = (page: string): void => {
+    if (reportTimers.has(page)) return;
+    const timer = globalThis.setTimeout(() => {
+      reportTimers.delete(page);
+      if (!stopped) reportPage(page);
+    }, 0);
+    reportTimers.set(page, timer);
+  };
+
+  const report = (): void => {
+    if (currentPage) reportPage(currentPage);
+  };
+
   const startView = (page: string): void => {
     report();
     currentPage = page;
-    lastReport = '';
-    delete metrics.lcpMs;
-    delete metrics.fidMs;
-    delete metrics.cls;
-    delete metrics.inpMs;
-    delete metrics.ttfbMs;
-
-    if (isFirstView && options.trackWebVitals) {
-      const navigation = performance
-        .getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
-      if (navigation && navigation.responseStart >= 0) {
-        metrics.ttfbMs = Math.max(0, navigation.responseStart - navigation.startTime);
-      }
-    }
-    isFirstView = false;
+    metricsFor(page);
   };
 
-  if (typeof PerformanceObserver !== 'undefined') {
-    if (options.trackWebVitals) {
-      observe('largest-contentful-paint', observers, (entries) => {
-        const entry = entries[entries.length - 1] as
-          | LargestContentfulPaintEntry
-          | undefined;
-        if (!entry) return;
-        metrics.lcpMs = Math.max(0, entry.renderTime || entry.loadTime || entry.startTime);
-      });
-      observe('layout-shift', observers, (entries) => {
-        for (const entry of entries as LayoutShiftEntry[]) {
-          if (!entry.hadRecentInput) metrics.cls = (metrics.cls ?? 0) + entry.value;
+  if (options.trackWebVitals) {
+    unsubscribeVitals = subscribeToWebVitals(
+      (metric) => {
+        if (stopped) return;
+        const rawPage = metric.navigationURL || currentPage || window.location.href;
+        const page = hooks.sanitizeUrl(rawPage);
+        const metrics = metricsFor(page);
+        metrics.metricIds[metric.name.toLowerCase()] = metric.id;
+        metrics.navigationType = metric.navigationType;
+        switch (metric.name) {
+          case 'CLS':
+            metrics.cls = metric.value;
+            break;
+          case 'INP':
+            metrics.inpMs = metric.value;
+            break;
+          case 'LCP':
+            metrics.lcpMs = metric.value;
+            break;
+          case 'TTFB':
+            metrics.ttfbMs = metric.value;
+            break;
+          case 'FCP':
+            return;
         }
-      });
-      observe('first-input', observers, (entries) => {
-        const entry = entries[0] as FirstInputEntry | undefined;
-        if (!entry) return;
-        metrics.fidMs = Math.max(0, entry.processingStart - entry.startTime);
-        globalThis.setTimeout(report, 0);
-      });
-      observe('event', observers, (entries) => {
-        for (const entry of entries as EventTimingEntry[]) {
-          if (entry.interactionId > 0) {
-            metrics.inpMs = Math.max(metrics.inpMs ?? 0, entry.duration);
-          }
-        }
-      }, { durationThreshold: 40 });
-    }
+        scheduleReport(page);
+      },
+      options.onError,
+    );
 
+    // FID is no longer a Core Web Vital and is not exported by current
+    // web-vitals versions. Keep it as a best-effort backwards-compatible field.
+    observe('first-input', observers, (entries) => {
+      const entry = entries[0] as FirstInputEntry | undefined;
+      if (!entry || !currentPage) return;
+      metricsFor(currentPage).fidMs = Math.max(
+        0,
+        entry.processingStart - entry.startTime,
+      );
+      scheduleReport(currentPage);
+    });
+  }
+
+  if (typeof PerformanceObserver !== 'undefined') {
     if (options.trackLongTasks) {
       observe('longtask', observers, (entries) => {
         for (const entry of entries) {
@@ -184,38 +221,57 @@ export function instrumentPerformance(
     if (document.visibilityState === 'hidden') report();
   };
   const onPageHide = (): void => report();
-  const onFirstInteraction = (): void => {
-    globalThis.setTimeout(report, 0);
-  };
   document.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('pagehide', onPageHide);
-  window.addEventListener('pointerdown', onFirstInteraction, { once: true, capture: true });
-
-  if (options.trackWebVitals) {
-    const scheduleReport = (): void => {
-      removeLoadListener = undefined;
-      loadTimer = globalThis.setTimeout(report, 3_000);
-    };
-    if (document.readyState === 'complete') scheduleReport();
-    else {
-      window.addEventListener('load', scheduleReport, { once: true });
-      removeLoadListener = () => window.removeEventListener('load', scheduleReport);
-    }
-  }
 
   return {
     startView,
     report,
     stop: () => {
+      if (stopped) return;
       report();
+      stopped = true;
+      unsubscribeVitals?.();
       for (const observer of observers) observer.disconnect();
+      for (const timer of reportTimers.values()) globalThis.clearTimeout(timer);
+      reportTimers.clear();
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('pagehide', onPageHide);
-      window.removeEventListener('pointerdown', onFirstInteraction, true);
-      removeLoadListener?.();
-      if (loadTimer !== undefined) globalThis.clearTimeout(loadTimer);
     },
   };
+}
+
+function subscribeToWebVitals(
+  report: (metric: MetricType) => void,
+  onError?: (error: Error) => void,
+): () => void {
+  const subscriber: VitalSubscriber = { report, onError };
+  vitalSubscribers.add(subscriber);
+  if (!vitalCollectorStarted) {
+    vitalCollectorStarted = true;
+    void import('web-vitals')
+      .then(({ onCLS, onINP, onLCP, onTTFB }) => {
+        const publish = (metric: MetricType): void => {
+          for (const listener of vitalSubscribers) listener.report(metric);
+        };
+        const options = { reportAllChanges: true, reportSoftNavs: true };
+        onCLS(publish, options);
+        onINP(publish, options);
+        onLCP(publish, options);
+        onTTFB(publish, options);
+      })
+      .catch((error: unknown) => {
+        vitalCollectorStarted = false;
+        for (const listener of vitalSubscribers) {
+          reportInternalError(
+            listener.onError,
+            error,
+            'RUM Web Vitals failed to load',
+          );
+        }
+      });
+  }
+  return () => vitalSubscribers.delete(subscriber);
 }
 
 function observe(
@@ -224,6 +280,7 @@ function observe(
   onEntries: (entries: PerformanceEntry[]) => void,
   extra: Record<string, unknown> = {},
 ): void {
+  if (typeof PerformanceObserver === 'undefined') return;
   try {
     const observer = new PerformanceObserver((list) => {
       onEntries(list.getEntries());

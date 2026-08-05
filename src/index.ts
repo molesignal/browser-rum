@@ -10,11 +10,14 @@ export type {
   RumEventKind,
   RumInitConfiguration,
   RumInternalContext,
+  RumQueueDropReason,
   RumSessionReplayConfiguration,
   RumTransport,
   RumTransportRequest,
   RumTransportResponse,
+  RumTransportStats,
   RumUser,
+  TrackingConsent,
   UrlMatcher,
 } from './types.js';
 

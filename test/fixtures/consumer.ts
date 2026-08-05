@@ -4,9 +4,12 @@ import {
   type RumTransportRequest,
 } from '@molesignal/browser-rum';
 
+const clientToken =
+  'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF';
+
 const configuration: RumInitConfiguration = {
   applicationId: 'type-test',
-  clientToken: 'token',
+  clientToken,
   site: 'https://rum.example.test',
   sessionReplay: {
     blockSelector: '[data-private]',
@@ -26,6 +29,8 @@ const configuration: RumInitConfiguration = {
 };
 
 const rum = initRum(configuration);
+rum.setTrackingConsent('granted');
 rum.setUser({ id: 'user-1', plan: 'pro' });
 rum.addAction('typed action', { cart_size: 2 });
+rum.getTransportStats().queued;
 void rum.flush();

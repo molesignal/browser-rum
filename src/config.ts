@@ -5,6 +5,7 @@ import type {
   RumSessionReplayConfiguration,
   RumTransport,
   RumUser,
+  TrackingConsent,
   UrlMatcher,
 } from './types.js';
 
@@ -19,8 +20,10 @@ export interface NormalizedRumConfiguration {
   service: string;
   env?: string;
   version?: string;
+  debugId?: string;
   user?: RumUser;
   globalContext: RumContext;
+  trackingConsent: TrackingConsent;
 
   sessionSampleRate: number;
   sessionReplaySampleRate: number;
@@ -44,6 +47,9 @@ export interface NormalizedRumConfiguration {
   replayFlushInterval: number;
   replayBatchSize: number;
   maxQueueSize: number;
+  enablePersistentQueue: boolean;
+  retryBaseDelay: number;
+  retryMaxDelay: number;
   sessionInactivityTimeout: number;
   maxSessionDuration: number;
 
@@ -59,9 +65,15 @@ export function normalizeConfiguration(
     throw new TypeError('MoleSignal RUM configuration is required');
   }
   const applicationId = requiredString(config.applicationId, 'applicationId');
-  const clientToken = requiredString(config.clientToken, 'clientToken');
+  const clientToken = normalizeClientToken(config.clientToken);
   const site = normalizeSite(requiredString(config.site, 'site'));
   const trackUserInteractions = config.trackUserInteractions ?? false;
+  const version = cleanOptionalString(config.version);
+  const debugId = normalizeDebugId(config.debugId);
+  if (debugId && !version) {
+    throw new TypeError('MoleSignal RUM "version" is required when "debugId" is set');
+  }
+  const retryBaseDelay = clampInteger(config.retryBaseDelay, 1_000, 250, 60_000);
 
   return {
     applicationId,
@@ -69,9 +81,11 @@ export function normalizeConfiguration(
     site,
     service: cleanOptionalString(config.service) ?? applicationId,
     env: cleanOptionalString(config.env),
-    version: cleanOptionalString(config.version),
+    version,
+    debugId,
     user: normalizeUser(config.user),
     globalContext: { ...(config.globalContext ?? {}) },
+    trackingConsent: normalizeTrackingConsent(config.trackingConsent),
 
     sessionSampleRate: normalizeRate(config.sessionSampleRate, 100),
     sessionReplaySampleRate: normalizeRate(config.sessionReplaySampleRate, 0),
@@ -105,6 +119,14 @@ export function normalizeConfiguration(
     ),
     replayBatchSize: clampInteger(config.replayBatchSize, 100, 1, 200),
     maxQueueSize: clampInteger(config.maxQueueSize, 1_000, 20, 10_000),
+    enablePersistentQueue: config.enablePersistentQueue ?? true,
+    retryBaseDelay,
+    retryMaxDelay: clampInteger(
+      config.retryMaxDelay,
+      60_000,
+      retryBaseDelay,
+      5 * 60_000,
+    ),
     sessionInactivityTimeout: clampInteger(
       config.sessionInactivityTimeout,
       30 * 60_000,
@@ -170,14 +192,14 @@ export function rumEndpoint(
   const url = new URL(site);
   let path = url.pathname.replace(/\/+$/, '');
 
-  if (path.endsWith('/api/v1/rum/v1')) {
+  if (path.endsWith('/api/v1/rum')) {
     path = `${path}/${kind}`;
   } else if (path.endsWith('/api/v1')) {
-    path = `${path}/rum/v1/${kind}`;
+    path = `${path}/rum/${kind}`;
   } else if (path.endsWith('/api')) {
-    path = `${path}/v1/rum/v1/${kind}`;
+    path = `${path}/v1/rum/${kind}`;
   } else {
-    path = `${path}/api/v1/rum/v1/${kind}`;
+    path = `${path}/api/v1/rum/${kind}`;
   }
 
   url.pathname = path.replace(/\/{2,}/g, '/');
@@ -207,6 +229,35 @@ function requiredString(value: unknown, field: string): string {
     throw new TypeError(`MoleSignal RUM "${field}" must be a non-empty string`);
   }
   return value.trim();
+}
+
+function normalizeClientToken(value: unknown): string {
+  const token = requiredString(value, 'clientToken');
+  if (!/^msrum_[0-9A-Za-z]{16}_[0-9A-Za-z]{32}$/.test(token)) {
+    throw new TypeError(
+      'MoleSignal RUM "clientToken" must be an application-bound msrum_<16>_<32> token',
+    );
+  }
+  return token;
+}
+
+function normalizeTrackingConsent(value: TrackingConsent | undefined): TrackingConsent {
+  if (value === undefined) return 'granted';
+  if (value !== 'granted' && value !== 'not-granted') {
+    throw new TypeError(
+      'MoleSignal RUM "trackingConsent" must be "granted" or "not-granted"',
+    );
+  }
+  return value;
+}
+
+function normalizeDebugId(value: unknown): string | undefined {
+  const debugId = cleanOptionalString(value);
+  if (!debugId) return undefined;
+  if (debugId.length > 128 || !/^[0-9A-Za-z{}_.:-]+$/.test(debugId)) {
+    throw new TypeError('MoleSignal RUM "debugId" is not valid');
+  }
+  return debugId;
 }
 
 function cleanOptionalString(value: unknown): string | undefined {
