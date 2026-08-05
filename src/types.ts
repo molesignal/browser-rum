@@ -41,6 +41,28 @@ export type UrlMatcher = string | RegExp | ((url: string) => boolean);
 
 export type PrivacyLevel = 'mask' | 'allow';
 
+/**
+ * Session replay is captured as rrweb DOM snapshots and incremental changes.
+ * Inputs are always masked. These selectors provide additional page-specific
+ * privacy controls without requiring application code changes.
+ */
+export interface RumSessionReplayConfiguration {
+  /** Entire matching subtrees are replaced with placeholders. */
+  blockSelector?: string;
+  /** Text inside matching elements is masked. */
+  maskTextSelector?: string;
+  /** Matching events and mutations are ignored. */
+  ignoreSelector?: string;
+  /** Periodic full-snapshot interval in milliseconds. Defaults to 5 minutes. */
+  checkoutInterval?: number;
+  /** Inline dynamically loaded fonts into the recording. Disabled by default. */
+  collectFonts?: boolean;
+  /** Inline image bytes into the recording. Disabled by default. */
+  inlineImages?: boolean;
+  /** Record cooperating cross-origin frames. Disabled by default. */
+  recordCrossOriginIframes?: boolean;
+}
+
 export interface RumInitConfiguration {
   /** Stable application identifier shown in MoleSignal RUM views. */
   applicationId: string;
@@ -56,8 +78,10 @@ export interface RumInitConfiguration {
 
   /** Percentage in the inclusive 0..100 range. Defaults to 100. */
   sessionSampleRate?: number;
-  /** Percentage of sampled sessions that record a replay timeline. Defaults to 0. */
+  /** Percentage of sampled sessions that record DOM replay. Defaults to 0. */
   sessionReplaySampleRate?: number;
+  /** DOM recording and privacy controls for sampled session replay. */
+  sessionReplay?: RumSessionReplayConfiguration;
 
   trackUserInteractions?: boolean;
   trackFrustrations?: boolean;
@@ -118,4 +142,3 @@ export interface RumClient {
   flush(): Promise<void>;
   stop(): Promise<void>;
 }
-

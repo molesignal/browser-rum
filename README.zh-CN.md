@@ -2,7 +2,7 @@
 
 MoleSignal 官方浏览器端 Real User Monitoring SDK，采集会话、页面访问、用户行为、
 前端错误、Web Vitals、网络资源、W3C Trace Context 关联，以及可选的隐私友好型
-会话回放时间线。
+会话 DOM 回放。
 
 [English](README.md)
 
@@ -89,14 +89,22 @@ const rum = initRum({
   site: 'https://molesignal.example.com',
   sessionSampleRate: 100,
   sessionReplaySampleRate: 20,
+  sessionReplay: {
+    blockSelector: '[data-molesignal-block]',
+    maskTextSelector: '[data-molesignal-mask]',
+    ignoreSelector: '[data-molesignal-ignore]',
+  },
 });
 
 rum.startSessionReplayRecording();
 rum.stopSessionReplayRecording();
 ```
 
-当前 MoleSignal 回放界面采用事件时间线：SDK 记录导航、交互、网络请求和错误，
-不会序列化 DOM 内容或表单输入值。
+采样命中的回放会使用 rrweb 记录 DOM 全量快照与增量变化，包括鼠标移动、点击、滚动、
+视口变化和媒体状态；可访问的样式表会内联。所有输入框与可编辑区域内容始终脱敏，
+`defaultPrivacyLevel: 'mask'` 还会遮罩全部页面文本。可以用上述选择器阻止敏感子树、
+在允许普通文本时单独遮罩指定区域，或忽略高噪声元素。字体、内联图片以及协作式
+跨域 iframe 默认关闭，因为这些能力可能显著增加回放体积。
 
 ## Trace 关联
 
@@ -155,4 +163,3 @@ npm run build
 
 测试覆盖公开 API、SSR、四类 MoleSignal ingest payload、回放分段、隐私脱敏和
 W3C Trace Context 关联。
-

@@ -16,7 +16,15 @@ interface ReplayEnvelope {
   event: RumContext;
 }
 
+interface ReplaySegment {
+  sessionId: string;
+  seq: number;
+  events: RumContext[];
+}
+
 const MAX_KEEPALIVE_BODY_BYTES = 48 * 1024;
+const TARGET_REPLAY_SEGMENT_BYTES = 1024 * 1024;
+const MAX_REPLAY_REQUEST_BYTES = 8 * 1024 * 1024;
 
 export class EventTransport {
   private readonly queues: Record<IngestKind, RumContext[]> = {
@@ -25,6 +33,7 @@ export class EventTransport {
     error: [],
   };
   private replayQueue: ReplayEnvelope[] = [];
+  private replayRetrySegments: ReplaySegment[] = [];
   private readonly endpoints: Record<RumEventKind, string>;
   private readonly transport: RumTransport;
   private eventTimer?: ReturnType<typeof globalThis.setInterval>;
@@ -67,9 +76,9 @@ export class EventTransport {
   }
 
   enqueueReplay(sessionId: string, event: RumContext): void {
-    this.ensureReplayCapacity();
+    if (!this.ensureReplayCapacity()) return;
     this.replayQueue.push({ sessionId, event });
-    if (this.replayQueue.length >= this.config.replayBatchSize) {
+    if (event.type === 2 || this.replayQueue.length >= this.config.replayBatchSize) {
       void this.flushReplay(false);
     }
   }
@@ -134,7 +143,7 @@ export class EventTransport {
 
   private async flushReplayQueue(keepalive: boolean): Promise<void> {
     const pending = this.replayQueue.splice(0);
-    if (pending.length === 0) return;
+    const segments = this.replayRetrySegments.splice(0);
 
     const grouped = new Map<string, ReplayEnvelope[]>();
     for (const envelope of pending) {
@@ -143,9 +152,7 @@ export class EventTransport {
       grouped.set(envelope.sessionId, list);
     }
 
-    const groups = Array.from(grouped.entries());
-    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
-      const [sessionId, envelopes] = groups[groupIndex] as [string, ReplayEnvelope[]];
+    for (const [sessionId, envelopes] of grouped) {
       const chunks = chunkBySerializedSize(
         envelopes,
         this.config.replayBatchSize,
@@ -154,24 +161,33 @@ export class EventTransport {
           seq: 0,
           events: items.map((item) => item.event),
         }),
+        keepalive ? MAX_KEEPALIVE_BODY_BYTES : TARGET_REPLAY_SEGMENT_BYTES,
       );
 
-      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-        const chunk = chunks[chunkIndex] ?? [];
-        const body = {
-          session_id: sessionId,
+      for (const chunk of chunks) {
+        segments.push({
+          sessionId,
           seq: this.nextReplaySequence(sessionId),
           events: chunk.map((item) => item.event),
-        };
-        const result = await this.send('replay', body, keepalive);
-        if (result === 'retry') {
-          const failed = chunks.slice(chunkIndex).flat();
-          const laterGroups = groups
-            .slice(groupIndex + 1)
-            .flatMap(([, items]) => items);
-          this.prependReplayWithLimit([...failed, ...laterGroups]);
-          return;
-        }
+        });
+      }
+    }
+
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (!segment) continue;
+      const result = await this.send(
+        'replay',
+        {
+          session_id: segment.sessionId,
+          seq: segment.seq,
+          events: segment.events,
+        },
+        keepalive,
+      );
+      if (result === 'retry') {
+        this.replayRetrySegments.unshift(...segments.slice(index));
+        return;
       }
     }
   }
@@ -188,6 +204,14 @@ export class EventTransport {
       reportInternalError(this.config.onError, error, `RUM ${kind} serialization failed`);
       return 'drop';
     }
+    if (kind === 'replay' && byteLength(serialized) > MAX_REPLAY_REQUEST_BYTES) {
+      reportInternalError(
+        this.config.onError,
+        new Error('replay segment exceeds 8 MiB'),
+        'RUM replay upload dropped',
+      );
+      return 'drop';
+    }
 
     const request: RumTransportRequest = {
       url: this.endpoints[kind],
@@ -197,7 +221,7 @@ export class EventTransport {
         'content-type': 'application/json',
         'x-molesignal-rum': 'browser-rum/0.1.0',
       },
-      keepalive,
+      keepalive: keepalive && byteLength(serialized) <= MAX_KEEPALIVE_BODY_BYTES,
       kind,
     };
 
@@ -224,7 +248,8 @@ export class EventTransport {
       this.queues.session.length +
       this.queues.action.length +
       this.queues.error.length +
-      this.replayQueue.length
+      this.replayQueue.length +
+      this.replayRetrySegments.reduce((total, segment) => total + segment.events.length, 0)
     );
   }
 
@@ -241,13 +266,15 @@ export class EventTransport {
     else this.replayQueue.shift();
   }
 
-  private ensureReplayCapacity(): void {
-    if (this.totalQueued() < this.config.maxQueueSize) return;
+  private ensureReplayCapacity(): boolean {
+    if (this.totalQueued() < this.config.maxQueueSize) return true;
     if (this.replayQueue.length > 0) {
       this.replayQueue.shift();
-      return;
+      return true;
     }
-    this.ensureCapacity('action');
+    // Retry segments are immutable once assigned a sequence. Mutating one
+    // could make a lost-response retry overwrite an already stored segment.
+    return false;
   }
 
   private prependWithLimit<T>(target: T[], values: T[]): void {
@@ -257,12 +284,6 @@ export class EventTransport {
     }
   }
 
-  private prependReplayWithLimit(values: ReplayEnvelope[]): void {
-    this.replayQueue.unshift(...values);
-    if (this.replayQueue.length > this.config.maxQueueSize) {
-      this.replayQueue.splice(this.config.maxQueueSize);
-    }
-  }
 }
 
 class FetchRumTransport implements RumTransport {
@@ -314,6 +335,7 @@ function chunkBySerializedSize<T>(
   items: T[],
   maxItems: number,
   wrapper: (items: T[]) => unknown = (chunk) => chunk,
+  maxBytes = MAX_KEEPALIVE_BODY_BYTES,
 ): T[][] {
   const chunks: T[][] = [];
   let current: T[] = [];
@@ -321,7 +343,7 @@ function chunkBySerializedSize<T>(
   for (const item of items) {
     const candidate = [...current, item];
     const size = byteLength(JSON.stringify(wrapper(candidate)));
-    if (current.length > 0 && (candidate.length > maxItems || size > MAX_KEEPALIVE_BODY_BYTES)) {
+    if (current.length > 0 && (candidate.length > maxItems || size > maxBytes)) {
       chunks.push(current);
       current = [item];
     } else {

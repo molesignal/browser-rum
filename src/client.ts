@@ -15,6 +15,7 @@ import type {
 } from './instrumentation/types.js';
 import { instrumentViews } from './instrumentation/views.js';
 import { type RumSession, SessionManager } from './session.js';
+import { ReplayRecorder } from './replay/recorder.js';
 import { EventTransport } from './transport.js';
 import type {
   RumClient,
@@ -40,6 +41,7 @@ export class BrowserRumClient implements RumClient {
   private readonly browser = isBrowserEnvironment();
   private readonly sessionManager: SessionManager;
   private readonly eventTransport: EventTransport;
+  private readonly replayRecorder: ReplayRecorder;
   private readonly browserEnvironment: RumContext;
   private readonly anonymousUserId?: string;
   private user?: RumUser;
@@ -61,6 +63,10 @@ export class BrowserRumClient implements RumClient {
     this.eventTransport = new EventTransport(config, (sessionId) =>
       this.sessionManager.nextReplaySequence(sessionId),
     );
+    this.replayRecorder = new ReplayRecorder(config, (sessionId, event) => {
+      const prepared = this.applyReplayBeforeSend(event);
+      if (prepared) this.eventTransport.enqueueReplay(sessionId, prepared);
+    });
     this.browserEnvironment = this.browser
       ? (readBrowserEnvironment() as RumContext)
       : {};
@@ -141,12 +147,12 @@ export class BrowserRumClient implements RumClient {
   startSessionReplayRecording(): void {
     if (this.stopped || !this.browser) return;
     this.replayOverride = true;
-    const session = this.prepareSession();
-    if (session?.sampled) this.recordReplaySnapshot(session);
+    this.prepareSession();
   }
 
   stopSessionReplayRecording(): void {
     this.replayOverride = false;
+    this.replayRecorder.stop();
   }
 
   getInternalContext(): RumInternalContext {
@@ -170,6 +176,7 @@ export class BrowserRumClient implements RumClient {
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = (async () => {
+      this.replayRecorder.stop();
       for (const cleanup of this.cleanups.reverse()) {
         try {
           cleanup();
@@ -186,7 +193,7 @@ export class BrowserRumClient implements RumClient {
 
   private start(): void {
     this.eventTransport.start();
-    const session = this.prepareSession();
+    this.prepareSession();
     if (this.config.sessionSampleRate <= 0) return;
 
     const hooks = this.instrumentationHooks();
@@ -217,9 +224,6 @@ export class BrowserRumClient implements RumClient {
     }
     this.installLifecycleListeners();
 
-    if (session && this.config.trackViewsManually && this.isReplayEnabled(session)) {
-      this.recordReplaySnapshot(session);
-    }
   }
 
   private instrumentationHooks(): InstrumentationHooks {
@@ -302,11 +306,10 @@ export class BrowserRumClient implements RumClient {
     this.enqueue('action', event);
 
     if (this.isReplayEnabled(session)) {
-      const replayType = input.type === 'view' ? 'snapshot' : input.type;
       this.recordReplay(
         session,
         compact({
-          type: replayType,
+          type: input.type,
           ts: Math.floor(timestamp / 1_000),
           href: page,
           url: input.url ? this.sanitizeUrl(input.url) : undefined,
@@ -396,8 +399,9 @@ export class BrowserRumClient implements RumClient {
       this.replayOverride = undefined;
       this.recentErrors.clear();
     }
+    if (this.isReplayEnabled(session)) this.replayRecorder.start(session.id);
+    else this.replayRecorder.stop();
     if (session.sampled && !session.reported) this.reportSession(session);
-    if (created && this.isReplayEnabled(session)) this.recordReplaySnapshot(session);
     return session;
   }
 
@@ -457,24 +461,6 @@ export class BrowserRumClient implements RumClient {
     if (prepared) this.eventTransport.enqueueReplay(session.id, prepared);
   }
 
-  private recordReplaySnapshot(session: RumSession): void {
-    if (!isBrowserEnvironment() || !this.isReplayEnabled(session)) return;
-    const page = this.currentViewUrl || this.sanitizeUrl(window.location.href);
-    this.recordReplay(
-      session,
-      compact({
-        type: 'snapshot',
-        ts: Date.now(),
-        href: page,
-        name: this.currentViewName || `View ${pagePath(page)}`,
-        viewport: {
-          width: window.innerWidth,
-          height: window.innerHeight,
-        },
-      }),
-    );
-  }
-
   private applyBeforeSend(kind: RumEventKind, event: RumContext): RumContext | undefined {
     if (this.config.beforeSend) {
       try {
@@ -484,6 +470,18 @@ export class BrowserRumClient implements RumClient {
       }
     }
     return sanitizeContext(event);
+  }
+
+  private applyReplayBeforeSend(event: RumContext): RumContext | undefined {
+    if (!this.config.beforeSend) return event;
+    try {
+      return this.config.beforeSend(event, { kind: 'replay' }) === false
+        ? undefined
+        : event;
+    } catch (error) {
+      reportInternalError(this.config.onError, error, 'RUM beforeSend failed');
+      return event;
+    }
   }
 
   private isReplayEnabled(session: RumSession): boolean {

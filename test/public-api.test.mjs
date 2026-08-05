@@ -182,8 +182,54 @@ test('session replay uploads ordered timeline segments', async () => {
     assert.match(replay.session_id, /^ses_/);
     assert.equal(replay.seq, 1);
     assert.ok(replay.events.length >= 2);
-    assert.ok(replay.events.some((event) => event.type === 'snapshot'));
+    // The lightweight Node browser fixture cannot run rrweb itself, but the
+    // correlated action timeline still shares the replay segment protocol.
+    assert.ok(replay.events.some((event) => event.type === 'view'));
     assert.ok(replay.events.some((event) => event.name === 'Add to cart'));
+
+    await client.stop();
+  } finally {
+    restoreBrowser();
+  }
+});
+
+test('session replay retries keep the same sequence and payload', async () => {
+  const restoreBrowser = installBrowser();
+  const sent = [];
+  let replayAttempts = 0;
+  try {
+    const client = initRum({
+      applicationId: 'retry-replay-app',
+      clientToken: 'token',
+      site: 'https://rum.example.test',
+      sessionSampleRate: 100,
+      sessionReplaySampleRate: 100,
+      trackViewsManually: true,
+      trackResources: false,
+      trackLongTasks: false,
+      trackWebVitals: false,
+      trackUserInteractions: false,
+      trackAnonymousUser: false,
+      flushInterval: 60_000,
+      replayFlushInterval: 60_000,
+      transport: {
+        async send(request) {
+          sent.push(structuredClone(request));
+          if (request.kind === 'replay' && replayAttempts++ === 0) {
+            return { ok: false, status: 503 };
+          }
+          return { ok: true, status: 200 };
+        },
+      },
+    });
+
+    client.addAction('Retry me');
+    await client.flush();
+    await client.flush();
+
+    const attempts = sent.filter((request) => request.kind === 'replay');
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(JSON.parse(attempts[0].body), JSON.parse(attempts[1].body));
 
     await client.stop();
   } finally {

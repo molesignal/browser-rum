@@ -2,6 +2,7 @@ import type {
   PrivacyLevel,
   RumContext,
   RumInitConfiguration,
+  RumSessionReplayConfiguration,
   RumTransport,
   RumUser,
   UrlMatcher,
@@ -23,6 +24,7 @@ export interface NormalizedRumConfiguration {
 
   sessionSampleRate: number;
   sessionReplaySampleRate: number;
+  sessionReplay: Required<RumSessionReplayConfiguration>;
   trackUserInteractions: boolean;
   trackFrustrations: boolean;
   trackResources: boolean;
@@ -73,6 +75,7 @@ export function normalizeConfiguration(
 
     sessionSampleRate: normalizeRate(config.sessionSampleRate, 100),
     sessionReplaySampleRate: normalizeRate(config.sessionReplaySampleRate, 0),
+    sessionReplay: normalizeSessionReplay(config.sessionReplay),
     trackUserInteractions,
     trackFrustrations: config.trackFrustrations ?? trackUserInteractions,
     trackResources: config.trackResources ?? true,
@@ -119,6 +122,45 @@ export function normalizeConfiguration(
     onError: config.onError,
     transport: config.transport,
   };
+}
+
+function normalizeSessionReplay(
+  replay: RumSessionReplayConfiguration | undefined,
+): Required<RumSessionReplayConfiguration> {
+  return {
+    blockSelector: normalizeSelector(
+      replay?.blockSelector,
+      '[data-molesignal-block]',
+      'sessionReplay.blockSelector',
+    ),
+    maskTextSelector: normalizeSelector(
+      replay?.maskTextSelector,
+      '[data-molesignal-mask]',
+      'sessionReplay.maskTextSelector',
+    ),
+    ignoreSelector: normalizeSelector(
+      replay?.ignoreSelector,
+      '[data-molesignal-ignore]',
+      'sessionReplay.ignoreSelector',
+    ),
+    checkoutInterval: clampInteger(
+      replay?.checkoutInterval,
+      5 * 60_000,
+      30_000,
+      30 * 60_000,
+    ),
+    collectFonts: replay?.collectFonts ?? false,
+    inlineImages: replay?.inlineImages ?? false,
+    recordCrossOriginIframes: replay?.recordCrossOriginIframes ?? false,
+  };
+}
+
+function normalizeSelector(value: string | undefined, fallback: string, field: string): string {
+  const selector = cleanOptionalString(value) ?? fallback;
+  if (selector.length > 1_024 || selector.includes('\0')) {
+    throw new TypeError(`MoleSignal RUM "${field}" is not a valid CSS selector`);
+  }
+  return selector;
 }
 
 export function rumEndpoint(

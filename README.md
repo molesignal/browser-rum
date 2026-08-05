@@ -2,7 +2,7 @@
 
 The official browser Real User Monitoring SDK for MoleSignal. It reports
 sessions, page views, user actions, frontend errors, Web Vitals, network
-resources, W3C trace correlation, and an optional privacy-aware replay timeline.
+resources, W3C trace correlation, and optional privacy-aware DOM session replay.
 
 [简体中文](README.zh-CN.md)
 
@@ -88,7 +88,7 @@ await rum.flush();
 The package is safe to import and initialize during SSR. Browser
 instrumentation starts only when `window`, `document`, and `navigator` exist.
 
-## Session replay timeline
+## Session replay
 
 Replay is disabled by default. Enable sampled replay at initialization or start
 it for the current sampled session:
@@ -100,15 +100,25 @@ const rum = initRum({
   site: 'https://molesignal.example.com',
   sessionSampleRate: 100,
   sessionReplaySampleRate: 20,
+  sessionReplay: {
+    blockSelector: '[data-molesignal-block]',
+    maskTextSelector: '[data-molesignal-mask]',
+    ignoreSelector: '[data-molesignal-ignore]',
+  },
 });
 
 rum.startSessionReplayRecording();
 rum.stopSessionReplayRecording();
 ```
 
-The current MoleSignal replay UI is event-timeline based. The SDK records
-navigation, interactions, network calls, and errors; it does not serialize DOM
-content or input values.
+Sampled replay sessions use rrweb full DOM snapshots and incremental mutations,
+including pointer movement, clicks, scrolling, viewport changes, and media
+state. Stylesheets are inlined when accessible. All input and contenteditable
+values are always masked; `defaultPrivacyLevel: 'mask'` additionally masks all page text. Use the
+selectors above to block sensitive subtrees, mask selected text when visible
+text is allowed, or ignore noisy elements. Font, inline-image, and cooperating
+cross-origin iframe capture remain opt-in because they can
+significantly increase recording size.
 
 ## Trace correlation
 
@@ -145,6 +155,7 @@ allowedTracingUrls: [
 | `user`, `globalContext` | unset | Initial identity and custom dimensions |
 | `sessionSampleRate` | `100` | Percentage of sessions collected |
 | `sessionReplaySampleRate` | `0` | Percentage of sampled sessions with replay |
+| `sessionReplay` | privacy-safe defaults | DOM recording selectors and optional capture controls |
 | `trackUserInteractions` | `false` | Capture clicks and form submissions |
 | `trackFrustrations` | interaction setting | Detect rage and dead clicks |
 | `trackResources` | `true` | Capture fetch, XHR, and resource timing |
@@ -194,4 +205,3 @@ npm run build
 
 `npm test` verifies the public API, SSR behavior, MoleSignal ingest payloads,
 replay segmentation, privacy redaction, and W3C trace correlation.
-

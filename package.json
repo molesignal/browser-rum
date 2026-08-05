@@ -60,5 +60,8 @@
   "devDependencies": {
     "tsup": "^8.5.1",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@rrweb/record": "^2.1.1"
   }
 }

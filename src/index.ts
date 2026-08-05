@@ -10,6 +10,7 @@ export type {
   RumEventKind,
   RumInitConfiguration,
   RumInternalContext,
+  RumSessionReplayConfiguration,
   RumTransport,
   RumTransportRequest,
   RumTransportResponse,
