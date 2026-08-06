@@ -1,0 +1,65 @@
+name: release
+
+# After the first manual publication, configure npm trusted publishing for
+# @molesignal/browser-rum with the release.yml workflow and npm publish action.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  validate-version:
+    name: validate release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: verify tag matches package version
+        shell: bash
+        run: |
+          package_version="$(sed -nE 's/^[[:space:]]*"version":[[:space:]]*"([^"]+)".*/\1/p' package.json)"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [[ -z "$package_version" ]]; then
+            echo "Unable to read the package version from package.json" >&2
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Release tag version ($tag_version) does not match package.json ($package_version)" >&2
+            exit 1
+          fi
+
+  publish:
+    name: publish to npm
+    needs: validate-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - run: npm ci
+
+      - name: publish package
+        shell: bash
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          prerelease="${package_version#*-}"
+
+          if [[ "$prerelease" == "$package_version" ]]; then
+            dist_tag="latest"
+          else
+            dist_tag="${prerelease%%.*}"
+          fi
+
+          npm publish --tag "$dist_tag"

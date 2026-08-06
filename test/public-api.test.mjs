@@ -80,7 +80,7 @@ test('sessions, actions, and errors follow the MoleSignal ingest contract', asyn
     const sessionRequest = onlyRequest(sent, 'session');
     assert.equal(sessionRequest.url, 'https://rum.example.test/api/v1/rum/sessions');
     assert.equal(sessionRequest.headers.authorization, `Bearer ${CLIENT_TOKEN}`);
-    assert.equal(sessionRequest.headers['x-molesignal-rum'], 'browser-rum/0.1.0');
+    assert.equal(sessionRequest.headers['x-molesignal-rum'], 'browser-rum/0.1.0-alpha.1');
     const [session] = JSON.parse(sessionRequest.body);
     assert.match(session.session_id, /^ses_/);
     assert.equal(session.application, 'checkout-web');
