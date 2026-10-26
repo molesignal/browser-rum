@@ -1,6 +1,6 @@
 {
   "name": "@molesignal/browser-rum",
-  "version": "0.2.0-alpha.1",
+  "version": "0.2.0",
   "description": "MoleSignal browser real user monitoring SDK",
   "license": "Apache-2.0",
   "type": "module",

@@ -6,7 +6,7 @@ MoleSignal 官方浏览器端 Real User Monitoring SDK。它把页面视图、�
 
 [English](README.md)
 
-> **0.2.0-alpha.1 是不兼容升级。** SDK 现在使用 MoleSignal RUM 事件协议，不再写入
+> **0.2.0 是不兼容升级。** SDK 现在使用 MoleSignal RUM 事件协议，不再写入
 > `/rum/sessions`、`/rum/actions`、`/rum/errors`。详见[从 0.1 升级](#从-01-升级)。
 
 ## 安装
@@ -63,7 +63,7 @@ SDK 写入两个端点，均携带 `Authorization: Bearer <clientToken>`：
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0-alpha.1/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
@@ -383,7 +383,7 @@ init({
 
 ## 从 0.1 升级
 
-0.2.0-alpha.1 把 SDK 迁移到 MoleSignal RUM 事件协议，没有兼容模式。
+0.2.0 把 SDK 迁移到 MoleSignal RUM 事件协议，没有兼容模式。
 
 - **端点。** `POST /api/v1/rum/sessions`、`/actions`、`/errors` 已移除，一律发往
   `POST /api/v1/rum/events`。回放仍发往 `/api/v1/rum/replay`，请求体多了 `service`、`env`、`version`。自定义 `transport`

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-alpha.1
+## 0.2.0
 
 The SDK now speaks the MoleSignal RUM event contract (`contracts/rum/events`).
 It is not compatible with the 0.1 protocol and needs a server that serves

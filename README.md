@@ -8,7 +8,7 @@ DOM session replay.
 
 [简体中文](README.zh-CN.md)
 
-> **0.2.0-alpha.1 is a breaking release.** The SDK now speaks the MoleSignal
+> **0.2.0 is a breaking release.** The SDK now speaks the MoleSignal
 > RUM event protocol and no longer writes to `/rum/sessions`, `/rum/actions`
 > or `/rum/errors`. See [Upgrading from 0.1](#upgrading-from-01).
 
@@ -69,7 +69,7 @@ this snippet; callbacks passed to `onReady` wait until the script has loaded:
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0-alpha.1/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
@@ -428,7 +428,7 @@ WebKit.
 
 ## Upgrading from 0.1
 
-0.2.0-alpha.1 moves the SDK to the MoleSignal RUM event protocol. There is no
+0.2.0 moves the SDK to the MoleSignal RUM event protocol. There is no
 compatibility mode.
 
 - **Endpoints.** `POST /api/v1/rum/sessions`, `/actions` and `/errors` are gone;
