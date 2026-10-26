@@ -1,34 +1,36 @@
+import { unrefTimer } from './clock.js';
 import type { NormalizedRumConfiguration } from './config.js';
 import { rumEndpoint } from './config.js';
+import type { RumEvent, RumEventType } from './events.js';
 import {
   IndexedDbQueueStorage,
+  LEASE_RENEW_MS,
   type PersistedQueueEntry,
 } from './persistence.js';
 import type {
   RumContext,
-  RumEventKind,
   RumQueueDropReason,
+  RumRequestKind,
   RumTransport,
   RumTransportRequest,
   RumTransportResponse,
   RumTransportStats,
 } from './types.js';
 import {
+  byteLength,
   generateId,
   reportInternalError,
   SDK_VERSION,
 } from './utils.js';
-
-type IngestKind = Exclude<RumEventKind, 'replay'>;
 
 interface QueueEntryBase extends PersistedQueueEntry {
   attempts: number;
   nextAttemptAt: number;
 }
 
-interface IngestEntry extends QueueEntryBase {
-  kind: IngestKind;
-  event: RumContext;
+interface EventEntry extends QueueEntryBase {
+  kind: 'event';
+  event: RumEvent;
 }
 
 interface ReplayEnvelope extends QueueEntryBase {
@@ -44,35 +46,72 @@ interface ReplaySegment extends QueueEntryBase {
   events: RumContext[];
 }
 
-type StoredEntry = IngestEntry | ReplayEnvelope | ReplaySegment;
+type StoredEntry = EventEntry | ReplayEnvelope | ReplaySegment;
+
+interface RejectedEvent {
+  index: number;
+  reason: string;
+}
 
 interface SendResult {
   decision: 'ok' | 'drop' | 'retry';
   dropReason?: RumQueueDropReason;
   retryAfterMs?: number;
+  /** Events the server accepted the request for but refused individually. */
+  rejected?: RejectedEvent[];
 }
 
-const MAX_KEEPALIVE_BODY_BYTES = 48 * 1024;
+/** Chrome allows about 64 KiB of keepalive request bodies in flight. */
+const MAX_KEEPALIVE_BODY_BYTES = 60 * 1024;
+const TARGET_EVENTS_REQUEST_BYTES = 512 * 1024;
 const TARGET_REPLAY_SEGMENT_BYTES = 1024 * 1024;
 const MAX_REPLAY_REQUEST_BYTES = 8 * 1024 * 1024;
+/** The server takes 5 MiB per request; one event is never worth more than this. */
+const MAX_EVENT_BYTES = 1024 * 1024;
+
+/**
+ * Which events are given up first when the queue is full, and which go first
+ * into a request that may be the last one. Lower is more important.
+ */
+const IMPORTANCE: Record<RumEventType, number> = {
+  view: 0,
+  error: 1,
+  action: 2,
+  vital: 3,
+  long_task: 4,
+  resource: 5,
+};
+/** Raw replay events are worth less than the events that explain them. */
+const EVICTION_ORDER: Array<RumEventType | 'replay'> = [
+  'resource',
+  'long_task',
+  'replay',
+  'vital',
+  'action',
+  'error',
+  'view',
+];
+
+function viewRevision(event: RumEvent): number {
+  return event.type === 'view' ? event.view.revision : 0;
+}
 
 export class EventTransport {
-  private readonly queues: Record<IngestKind, IngestEntry[]> = {
-    session: [],
-    action: [],
-    error: [],
-  };
+  private queue: EventEntry[] = [];
   private replayQueue: ReplayEnvelope[] = [];
   private replayRetrySegments: ReplaySegment[] = [];
-  private readonly endpoints: Record<RumEventKind, string>;
+  private readonly endpoints: Record<RumRequestKind, string>;
   private readonly transport: RumTransport;
   private readonly storage: IndexedDbQueueStorage<PersistedQueueEntry>;
   private readonly restorePromise: Promise<void>;
   private storageChain: Promise<void> = Promise.resolve();
   private eventTimer?: ReturnType<typeof globalThis.setInterval>;
   private replayTimer?: ReturnType<typeof globalThis.setInterval>;
+  private leaseTimer?: ReturnType<typeof globalThis.setInterval>;
   private eventFlush?: Promise<void>;
+  private eventFollowUp?: Promise<void>;
   private replayFlush?: Promise<void>;
+  private replayFollowUp?: Promise<void>;
   private stopped = false;
   private readonly stats: Omit<RumTransportStats, 'queued'> = {
     sent: 0,
@@ -89,12 +128,12 @@ export class EventTransport {
 
   constructor(
     private readonly config: NormalizedRumConfiguration,
+    /** The tab that sends this queue; its rows are restored by the next page load in the tab. */
+    private readonly owner: string,
     private readonly nextReplaySequence: (sessionId: string) => number,
   ) {
     this.endpoints = {
-      session: rumEndpoint(config.site, 'sessions'),
-      action: rumEndpoint(config.site, 'actions'),
-      error: rumEndpoint(config.site, 'errors'),
+      events: rumEndpoint(config.site, 'events'),
       replay: rumEndpoint(config.site, 'replay'),
     };
     this.transport = config.transport ?? new FetchRumTransport();
@@ -105,49 +144,63 @@ export class EventTransport {
   start(): void {
     if (this.stopped) return;
     if (this.eventTimer === undefined) {
-      this.eventTimer = globalThis.setInterval(() => {
-        void this.flushEvents(false, false);
-      }, this.config.flushInterval);
+      this.eventTimer = unrefTimer(
+        globalThis.setInterval(() => {
+          void this.flushEvents(false, false);
+        }, this.config.flushInterval),
+      );
     }
     if (this.replayTimer === undefined) {
-      this.replayTimer = globalThis.setInterval(() => {
-        void this.flushReplay(false, false);
-      }, this.config.replayFlushInterval);
+      this.replayTimer = unrefTimer(
+        globalThis.setInterval(() => {
+          void this.flushReplay(false, false);
+        }, this.config.replayFlushInterval),
+      );
+    }
+    if (this.leaseTimer === undefined) {
+      this.leaseTimer = unrefTimer(
+        globalThis.setInterval(() => {
+          void this.storage.renewLease(this.owner).catch(() => undefined);
+        }, LEASE_RENEW_MS),
+      );
     }
     void this.restorePromise.then(() => this.flush(false, false));
   }
 
-  enqueue(kind: IngestKind, event: RumContext): boolean {
+  /**
+   * Queues an event. A view that is already waiting in the queue is replaced by
+   * its newer revision: the server only keeps the highest one anyway.
+   */
+  enqueue(event: RumEvent): boolean {
     if (this.stopped) return false;
-    if (kind === 'session') {
-      const sessionId = stringField(event, 'session_id');
-      const existing = sessionId
-        ? this.queues.session.find((entry) => stringField(entry.event, 'session_id') === sessionId)
-        : undefined;
-      if (existing) {
-        existing.event = event;
-        existing.attempts = 0;
-        existing.nextAttemptAt = 0;
-        this.persist(existing);
+    if (event.type === 'view') {
+      const waiting = this.queue.find(
+        (entry) => entry.event.type === 'view' && entry.event.view.id === event.view.id,
+      );
+      if (waiting) {
+        if (event.view.revision >= viewRevision(waiting.event)) {
+          waiting.event = event;
+          this.persist(waiting);
+        }
         return true;
       }
     }
-    if (!this.ensureCapacity()) return false;
-    const entry: IngestEntry = {
-      ...this.entryBase(kind),
-      kind,
+    if (!this.makeRoom(event.type)) return false;
+    const entry: EventEntry = {
+      ...this.entryBase('event'),
+      kind: 'event',
       event,
     };
-    this.queues[kind].push(entry);
+    this.queue.push(entry);
     this.persist(entry);
-    if (this.queues[kind].length >= this.config.batchSize) {
+    if (this.queue.length >= this.config.batchSize) {
       void this.flushEvents(false, false);
     }
     return true;
   }
 
   enqueueReplay(sessionId: string, event: RumContext): boolean {
-    if (this.stopped || !this.ensureReplayCapacity()) return false;
+    if (this.stopped || !this.makeRoom('replay')) return false;
     const entry: ReplayEnvelope = {
       ...this.entryBase('replay_event'),
       kind: 'replay_event',
@@ -177,7 +230,11 @@ export class EventTransport {
     };
   }
 
-  /** Explicit flushes bypass retry delays; timer-driven flushes honor them. */
+  /**
+   * Explicit flushes bypass retry delays; timer-driven flushes honor them. A
+   * `keepalive` flush is the page's last chance: it sends the most important
+   * events first, in a request that is issued before this call returns.
+   */
   async flush(keepalive = false, force = true): Promise<void> {
     await Promise.all([
       this.flushEvents(keepalive, force),
@@ -190,6 +247,7 @@ export class EventTransport {
     await this.flush(true, true);
     await this.storageChain;
     this.stopped = true;
+    await this.storage.releaseLease(this.owner).catch(() => undefined);
   }
 
   /** Stops immediately and removes queued telemetry after consent is revoked. */
@@ -201,9 +259,7 @@ export class EventTransport {
     );
     await this.restorePromise;
     await Promise.allSettled(activeFlushes);
-    this.queues.session.length = 0;
-    this.queues.action.length = 0;
-    this.queues.error.length = 0;
+    this.queue.length = 0;
     this.replayQueue.length = 0;
     this.replayRetrySegments.length = 0;
     await this.storageChain;
@@ -211,6 +267,10 @@ export class EventTransport {
   }
 
   private stopTimers(): void {
+    if (this.leaseTimer !== undefined) {
+      globalThis.clearInterval(this.leaseTimer);
+      this.leaseTimer = undefined;
+    }
     if (this.eventTimer !== undefined) {
       globalThis.clearInterval(this.eventTimer);
       this.eventTimer = undefined;
@@ -223,15 +283,21 @@ export class EventTransport {
 
   private flushEvents(keepalive: boolean, force: boolean): Promise<void> {
     if (this.stopped && !this.eventFlush) return Promise.resolve();
-    if (this.eventFlush) return this.eventFlush;
+    // The page may be going away: do not wait behind a flush that is in progress.
+    if (keepalive) return this.sendQueuedEvents(true, force);
+    if (this.eventFlush) {
+      if (!force) return this.eventFlush;
+      // An explicit flush also sends what was queued after the running one began.
+      this.eventFollowUp ??= this.eventFlush.then(() => {
+        this.eventFollowUp = undefined;
+        return this.flushEvents(false, true);
+      });
+      return this.eventFollowUp;
+    }
     this.eventFlush = (async () => {
       await this.restorePromise;
       await this.storageChain;
-      await Promise.all(
-        (['session', 'action', 'error'] as const).map((kind) =>
-          this.flushIngestKind(kind, keepalive, force),
-        ),
-      );
+      await this.sendQueuedEvents(false, force);
     })().finally(() => {
       this.eventFlush = undefined;
     });
@@ -240,7 +306,14 @@ export class EventTransport {
 
   private flushReplay(keepalive: boolean, force: boolean): Promise<void> {
     if (this.stopped && !this.replayFlush) return Promise.resolve();
-    if (this.replayFlush) return this.replayFlush;
+    if (this.replayFlush) {
+      if (!force) return this.replayFlush;
+      this.replayFollowUp ??= this.replayFlush.then(() => {
+        this.replayFollowUp = undefined;
+        return this.flushReplay(keepalive, true);
+      });
+      return this.replayFollowUp;
+    }
     this.replayFlush = (async () => {
       await this.restorePromise;
       await this.storageChain;
@@ -251,58 +324,100 @@ export class EventTransport {
     return this.replayFlush;
   }
 
-  private async flushIngestKind(
-    kind: IngestKind,
-    keepalive: boolean,
-    force: boolean,
-  ): Promise<void> {
+  private async sendQueuedEvents(keepalive: boolean, force: boolean): Promise<void> {
     const now = Date.now();
-    const pending = this.queues[kind].splice(0);
-    const ready = pending.filter((entry) => force || entry.nextAttemptAt <= now);
+    const pending = this.queue.splice(0);
+    let ready = pending.filter((entry) => force || entry.nextAttemptAt <= now);
     const deferred = pending.filter((entry) => !force && entry.nextAttemptAt > now);
     if (ready.length === 0) {
-      this.queues[kind].push(...deferred);
+      this.queue.unshift(...deferred);
       return;
+    }
+    if (keepalive) {
+      ready = [...ready].sort(
+        (left, right) => IMPORTANCE[left.event.type] - IMPORTANCE[right.event.type],
+      );
     }
 
-    let chunks: IngestEntry[][];
-    try {
-      chunks = chunkBySerializedSize(
-        ready,
-        this.config.batchSize,
-        (items) => items.map((item) => item.event),
-      );
-    } catch (error) {
-      this.dropEntries(ready, 'serialization', error);
-      this.queues[kind].push(...deferred);
-      return;
-    }
+    const serialized = this.serializeEntries(ready);
+    const maxBytes = keepalive ? MAX_KEEPALIVE_BODY_BYTES : TARGET_EVENTS_REQUEST_BYTES;
+    const chunks = chunkSerialized(serialized, this.config.batchSize, maxBytes);
 
     for (let index = 0; index < chunks.length; index += 1) {
       if (this.stopped) return;
       const chunk = chunks[index] ?? [];
+      const entries = chunk.map((item) => item.entry);
       const result = await this.send(
-        kind,
-        chunk.map((entry) => entry.event),
+        'events',
+        `[${chunk.map((item) => item.json).join(',')}]`,
         keepalive,
       );
       if (result.decision === 'ok') {
-        this.stats.sent += chunk.length;
-        this.removePersisted(chunk);
+        this.acknowledge(entries, result.rejected ?? []);
         continue;
       }
       if (result.decision === 'drop') {
-        this.dropEntries(chunk, result.dropReason ?? 'rejected');
+        this.dropEntries(entries, result.dropReason ?? 'rejected');
         continue;
       }
 
-      this.markForRetry(chunk, result.retryAfterMs);
-      const remaining = chunks.slice(index + 1).flat();
-      this.queues[kind].unshift(...chunk, ...remaining);
-      this.queues[kind].push(...deferred);
+      this.markForRetry(entries, result.retryAfterMs);
+      const remaining = chunks.slice(index + 1).flat().map((item) => item.entry);
+      this.queue.unshift(...entries, ...remaining, ...deferred);
       return;
     }
-    this.queues[kind].push(...deferred);
+    this.queue.unshift(...deferred);
+  }
+
+  /** Serializes each event once; an event that cannot be serialized is dropped. */
+  private serializeEntries(
+    entries: EventEntry[],
+  ): Array<{ entry: EventEntry; json: string; bytes: number }> {
+    const result: Array<{ entry: EventEntry; json: string; bytes: number }> = [];
+    for (const entry of entries) {
+      try {
+        const json = JSON.stringify(entry.event);
+        const bytes = byteLength(json);
+        if (bytes > MAX_EVENT_BYTES) {
+          this.dropEntries(
+            [entry],
+            'payload_too_large',
+            new Error(`a ${entry.event.type} event is ${bytes} bytes`),
+          );
+          continue;
+        }
+        result.push({ entry, json, bytes });
+      } catch (error) {
+        this.dropEntries([entry], 'serialization', error);
+      }
+    }
+    return result;
+  }
+
+  /** Marks a request's events as delivered, except those the server refused. */
+  private acknowledge(entries: EventEntry[], rejected: RejectedEvent[]): void {
+    const refused = new Set<number>();
+    for (const item of rejected) {
+      if (Number.isInteger(item.index) && item.index >= 0 && item.index < entries.length) {
+        refused.add(item.index);
+      }
+    }
+    this.stats.sent += entries.length - refused.size;
+    this.removePersisted(entries);
+    if (refused.size === 0) return;
+
+    this.stats.dropped += refused.size;
+    this.stats.droppedByReason.rejected += refused.size;
+    const samples = rejected
+      .filter((item) => refused.has(item.index))
+      .slice(0, 3)
+      .map((item) => `#${item.index} ${item.reason}`)
+      .join('; ');
+    reportInternalError(
+      this.config.onError,
+      new Error(`${refused.size} of ${entries.length} events were refused: ${samples}`),
+      'RUM events rejected',
+    );
   }
 
   private async flushReplayQueue(keepalive: boolean, force: boolean): Promise<void> {
@@ -329,14 +444,13 @@ export class EventTransport {
     const convertedIds = new Set<string>();
     try {
       for (const [sessionId, envelopes] of grouped) {
-        const chunks = chunkBySerializedSize(
-          envelopes,
+        const serialized = envelopes.map((entry) => {
+          const json = JSON.stringify(entry.event);
+          return { entry, json, bytes: byteLength(json) };
+        });
+        const chunks = chunkSerialized(
+          serialized,
           this.config.replayBatchSize,
-          (items) => ({
-            session_id: sessionId,
-            seq: 0,
-            events: items.map((item) => item.event),
-          }),
           keepalive ? MAX_KEEPALIVE_BODY_BYTES : TARGET_REPLAY_SEGMENT_BYTES,
         );
         for (const chunk of chunks) {
@@ -345,13 +459,13 @@ export class EventTransport {
             kind: 'replay_segment',
             sessionId,
             seq: this.nextReplaySequence(sessionId),
-            events: chunk.map((item) => item.event),
+            events: chunk.map((item) => item.entry.event),
           };
           await this.storage.replace(
-            chunk.map((item) => item.id),
+            chunk.map((item) => item.entry.id),
             segment,
           );
-          for (const item of chunk) convertedIds.add(item.id);
+          for (const item of chunk) convertedIds.add(item.entry.id);
           readySegments.push(segment);
         }
       }
@@ -372,11 +486,16 @@ export class EventTransport {
       if (!segment) continue;
       const result = await this.send(
         'replay',
-        {
+        JSON.stringify({
           session_id: segment.sessionId,
           seq: segment.seq,
           events: segment.events,
-        },
+          // A segment has no event to say where its session runs, and what the application keeps
+          // of its sessions can depend on it. Unset labels are left out.
+          service: this.config.service,
+          env: this.config.env,
+          version: this.config.version,
+        }),
         keepalive,
       );
       if (result.decision === 'ok') {
@@ -406,18 +525,12 @@ export class EventTransport {
   }
 
   private async send(
-    kind: RumEventKind,
-    body: unknown,
+    kind: RumRequestKind,
+    serialized: string,
     keepalive: boolean,
   ): Promise<SendResult> {
-    let serialized: string;
-    try {
-      serialized = JSON.stringify(body);
-    } catch (error) {
-      reportInternalError(this.config.onError, error, `RUM ${kind} serialization failed`);
-      return { decision: 'drop', dropReason: 'serialization' };
-    }
-    if (kind === 'replay' && byteLength(serialized) > MAX_REPLAY_REQUEST_BYTES) {
+    const size = byteLength(serialized);
+    if (kind === 'replay' && size > MAX_REPLAY_REQUEST_BYTES) {
       reportInternalError(
         this.config.onError,
         new Error('replay segment exceeds 8 MiB'),
@@ -434,13 +547,18 @@ export class EventTransport {
         'content-type': 'application/json',
         'x-molesignal-rum': `browser-rum/${SDK_VERSION}`,
       },
-      keepalive: keepalive && byteLength(serialized) <= MAX_KEEPALIVE_BODY_BYTES,
+      keepalive: keepalive && size <= MAX_KEEPALIVE_BODY_BYTES,
       kind,
     };
 
     try {
       const response = await this.transport.send(request);
-      if (response.ok) return { decision: 'ok' };
+      if (response.ok) {
+        return {
+          decision: 'ok',
+          rejected: kind === 'events' ? parseRejected(response.body) : undefined,
+        };
+      }
       const message = `${response.status} ${response.statusText ?? ''}${
         response.body ? `: ${response.body.slice(0, 512)}` : ''
       }`.trim();
@@ -460,9 +578,7 @@ export class EventTransport {
 
   private totalQueued(): number {
     return (
-      this.queues.session.length +
-      this.queues.action.length +
-      this.queues.error.length +
+      this.queue.length +
       this.replayQueue.length +
       this.replayRetrySegments.reduce(
         (total, segment) => total + segment.events.length,
@@ -471,30 +587,30 @@ export class EventTransport {
     );
   }
 
-  private ensureCapacity(): boolean {
+  /**
+   * Makes room for one more entry by giving up the least important one that is
+   * not more important than the newcomer; the newcomer is dropped when there is none.
+   */
+  private makeRoom(incoming: RumEventType | 'replay'): boolean {
     if (this.totalQueued() < this.config.maxQueueSize) return true;
-    const candidate =
-      this.queues.action.shift() ??
-      this.replayQueue.shift() ??
-      this.queues.error.shift() ??
-      this.queues.session.shift();
-    if (!candidate) {
-      this.countDrop('queue_full');
-      return false;
+    for (const type of EVICTION_ORDER.slice(0, EVICTION_ORDER.indexOf(incoming) + 1)) {
+      if (type === 'replay') {
+        const replay = this.replayQueue.shift();
+        if (replay) {
+          this.dropEntries([replay], 'queue_full');
+          return true;
+        }
+        continue;
+      }
+      const index = this.queue.findIndex((entry) => entry.event.type === type);
+      if (index >= 0) {
+        const [candidate] = this.queue.splice(index, 1);
+        if (candidate) this.dropEntries([candidate], 'queue_full');
+        return true;
+      }
     }
-    this.dropEntries([candidate], 'queue_full');
-    return true;
-  }
-
-  private ensureReplayCapacity(): boolean {
-    if (this.totalQueued() < this.config.maxQueueSize) return true;
-    const candidate = this.replayQueue.shift() ?? this.queues.action.shift();
-    if (!candidate) {
-      this.countDrop('queue_full');
-      return false;
-    }
-    this.dropEntries([candidate], 'queue_full');
-    return true;
+    this.countDrop('queue_full');
+    return false;
   }
 
   private markForRetry<T extends StoredEntry>(
@@ -546,6 +662,7 @@ export class EventTransport {
     return {
       id: generateId('queue'),
       queueKey: this.storage.queueKey,
+      owner: this.owner,
       kind,
       createdAt: Date.now(),
       attempts: 0,
@@ -567,14 +684,12 @@ export class EventTransport {
   }
 
   private async restore(): Promise<void> {
-    const stored = await this.storage.load();
-    const existing = new Set<string>([
-      ...this.queues.session,
-      ...this.queues.action,
-      ...this.queues.error,
-      ...this.replayQueue,
-      ...this.replayRetrySegments,
-    ].map((entry) => entry.id));
+    const stored = await this.storage.claim(this.owner);
+    const existing = new Set<string>(
+      [...this.queue, ...this.replayQueue, ...this.replayRetrySegments].map(
+        (entry) => entry.id,
+      ),
+    );
     const invalid: string[] = [];
     let restored = 0;
     for (const candidate of stored.sort((left, right) => left.createdAt - right.createdAt)) {
@@ -583,19 +698,15 @@ export class EventTransport {
         invalid.push(candidate.id);
         continue;
       }
-      if (candidate.kind === 'session') {
-        const sessionId = stringField(candidate.event, 'session_id');
-        const current = sessionId
-          ? this.queues.session.find(
-              (entry) => stringField(entry.event, 'session_id') === sessionId,
-            )
-          : undefined;
+      if (candidate.kind === 'event' && candidate.event.type === 'view') {
+        const viewId = candidate.event.view.id;
+        const current = this.queue.find(
+          (entry) => entry.event.type === 'view' && entry.event.view.id === viewId,
+        );
         if (current) {
-          if (candidate.createdAt > current.createdAt) {
+          // Keep one row per view: the newer revision wins.
+          if (candidate.event.view.revision > viewRevision(current.event)) {
             current.event = candidate.event;
-            current.createdAt = candidate.createdAt;
-            current.attempts = candidate.attempts;
-            current.nextAttemptAt = candidate.nextAttemptAt;
             this.persist(current);
           }
           invalid.push(candidate.id);
@@ -610,7 +721,7 @@ export class EventTransport {
         this.replayRetrySegments.push(candidate);
         restored += candidate.events.length;
       } else {
-        this.queues[candidate.kind].push(candidate);
+        this.queue.push(candidate);
         restored += 1;
       }
     }
@@ -623,7 +734,7 @@ export class EventTransport {
       }
     }
     while (this.totalQueued() > this.config.maxQueueSize) {
-      if (!this.ensureCapacity()) break;
+      if (!this.makeRoom('view')) break;
     }
   }
 }
@@ -653,12 +764,11 @@ class FetchRumTransport implements RumTransport {
       cache: 'no-store',
     });
     let body: string | undefined;
-    if (!response.ok) {
-      try {
-        body = await response.text();
-      } catch {
-        // Some opaque responses do not expose a body.
-      }
+    try {
+      // `{ accepted, rejected }` on success; the reason for a failure otherwise.
+      body = await response.text();
+    } catch {
+      // Some opaque responses do not expose a body.
     }
     return {
       ok: response.ok,
@@ -683,37 +793,44 @@ function parseRetryAfter(value: string | null): number | undefined {
   return Math.max(0, date - Date.now());
 }
 
-function chunkBySerializedSize<T>(
-  items: T[],
-  maxItems: number,
-  wrapper: (items: T[]) => unknown = (chunk) => chunk,
-  maxBytes = MAX_KEEPALIVE_BODY_BYTES,
-): T[][] {
-  const chunks: T[][] = [];
-  let current: T[] = [];
-
-  for (const item of items) {
-    const candidate = [...current, item];
-    const size = byteLength(JSON.stringify(wrapper(candidate)));
-    if (current.length > 0 && (candidate.length > maxItems || size > maxBytes)) {
-      chunks.push(current);
-      current = [item];
-    } else {
-      current = candidate;
+/** `{ accepted, rejected: [{ index, reason }] }`, tolerating any other body. */
+function parseRejected(body: string | undefined): RejectedEvent[] {
+  if (!body) return [];
+  try {
+    const parsed = JSON.parse(body) as { rejected?: unknown };
+    if (!Array.isArray(parsed.rejected)) return [];
+    const rejected: RejectedEvent[] = [];
+    for (const item of parsed.rejected as Array<Partial<RejectedEvent>>) {
+      if (typeof item?.index === 'number') {
+        rejected.push({ index: item.index, reason: String(item.reason ?? 'rejected') });
+      }
     }
+    return rejected;
+  } catch {
+    return [];
+  }
+}
+
+function chunkSerialized<T>(
+  items: Array<{ entry: T; json: string; bytes: number }>,
+  maxItems: number,
+  maxBytes: number,
+): Array<Array<{ entry: T; json: string; bytes: number }>> {
+  const chunks: Array<Array<{ entry: T; json: string; bytes: number }>> = [];
+  let current: Array<{ entry: T; json: string; bytes: number }> = [];
+  let size = 2;
+  for (const item of items) {
+    const itemSize = item.bytes + 1;
+    if (current.length > 0 && (current.length >= maxItems || size + itemSize > maxBytes)) {
+      chunks.push(current);
+      current = [];
+      size = 2;
+    }
+    current.push(item);
+    size += itemSize;
   }
   if (current.length > 0) chunks.push(current);
   return chunks;
-}
-
-function byteLength(value: string): number {
-  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(value).byteLength;
-  return value.length * 2;
-}
-
-function stringField(value: RumContext, field: string): string | undefined {
-  const candidate = value[field];
-  return typeof candidate === 'string' && candidate ? candidate : undefined;
 }
 
 function isStoredEntry(value: PersistedQueueEntry): value is StoredEntry {
@@ -738,10 +855,14 @@ function isStoredEntry(value: PersistedQueueEntry): value is StoredEntry {
       Array.isArray(candidate.events)
     );
   }
-  return (
-    (candidate.kind === 'session' ||
-      candidate.kind === 'action' ||
-      candidate.kind === 'error') &&
-    !!candidate.event
-  );
+  if (candidate.kind === 'event') {
+    const event = candidate.event as Partial<RumEvent> | undefined;
+    return (
+      !!event &&
+      typeof event === 'object' &&
+      typeof event.type === 'string' &&
+      typeof (event as { view?: { id?: unknown } }).view?.id === 'string'
+    );
+  }
+  return false;
 }

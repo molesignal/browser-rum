@@ -1,32 +1,36 @@
 {
   "name": "@molesignal/browser-rum",
-  "version": "0.1.0-alpha.1",
+  "version": "0.2.0-alpha.1",
   "description": "MoleSignal browser real user monitoring SDK",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "unpkg": "./dist/molesignal-rum.js",
+  "jsdelivr": "./dist/molesignal-rum.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
-    }
+    },
+    "./molesignal-rum.js": "./dist/molesignal-rum.js"
   },
   "files": [
     "dist",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "sideEffects": false,
   "scripts": {
     "build": "npm run build:js && npm run build:types",
-    "build:js": "tsup --config tsup.config.mjs",
+    "build:js": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup --config tsup.config.mjs",
     "build:types": "tsc --emitDeclarationOnly --declaration --noEmit false --outDir dist",
     "test": "npm run build && npm run test:unit && npm run test:types",
-    "test:unit": "node --test test/public-api.test.mjs",
+    "test:unit": "node --experimental-test-module-mocks --disable-warning=ExperimentalWarning --test --test-force-exit test/public-api.test.mjs test/views.test.mjs test/sessions.test.mjs test/global-api.test.mjs test/early-consent.test.mjs test/replay.test.mjs test/contract.test.mjs",
     "test:e2e": "npm run build && playwright test",
     "test:e2e:install": "playwright install chromium firefox webkit",
     "test:types": "tsc --ignoreConfig --noEmit --strict --skipLibCheck false --target ES2020 --module NodeNext --moduleResolution NodeNext --lib ES2020,DOM test/fixtures/consumer.ts",
@@ -62,6 +66,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
+    "ajv": "^8.20.0",
     "tsup": "^8.5.1",
     "typescript": "^7.0.2"
   },

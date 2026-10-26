@@ -6,14 +6,34 @@ const packageJson = JSON.parse(
   readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
 );
 
-export default defineConfig({
-  entry: ['src/index.ts'],
-  format: ['esm', 'cjs'],
-  clean: true,
-  splitting: true,
-  sourcemap: true,
-  treeshake: true,
-  define: {
-    __MOLESIGNAL_RUM_VERSION__: JSON.stringify(packageJson.version),
+const define = {
+  __MOLESIGNAL_RUM_VERSION__: JSON.stringify(packageJson.version),
+};
+
+// `dist` is emptied by the build script, so the two builds never clean each other.
+export default defineConfig([
+  {
+    entry: ['src/index.ts'],
+    format: ['esm', 'cjs'],
+    clean: false,
+    splitting: true,
+    sourcemap: true,
+    treeshake: true,
+    define,
   },
-});
+  {
+    // A single file for <script> tags and CDNs; it defines the global `MoleSignalRum`.
+    entry: { 'molesignal-rum': 'src/global.ts' },
+    format: ['iife'],
+    platform: 'browser',
+    target: 'es2020',
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    minify: true,
+    treeshake: true,
+    noExternal: [/.*/],
+    outExtension: () => ({ js: '.js' }),
+    define,
+  },
+]);

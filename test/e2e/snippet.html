@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MoleSignal browser RUM: asynchronous snippet</title>
+    <script>
+      // The loading snippet from the README. Calls wait in `q` until the bundle has loaded.
+      (function (w, d, s, u, n) {
+        w[n] = w[n] || {
+          q: [],
+          onReady: function (callback) {
+            w[n].q.push(callback);
+          },
+        };
+        var script = d.createElement(s);
+        script.async = 1;
+        script.src = u;
+        d.head.appendChild(script);
+      })(window, document, 'script', '/dist/molesignal-rum.js', 'MoleSignalRum');
+
+      MoleSignalRum.onReady(function () {
+        MoleSignalRum.init({
+          applicationId: 'cdn-e2e',
+          clientToken: 'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF',
+          site: window.location.origin,
+          trackUserInteractions: true,
+          sessionReplaySampleRate: 100,
+          flushInterval: 250,
+          replayFlushInterval: 250,
+        });
+        MoleSignalRum.setUser({ id: 'cdn-user' });
+        window.snippetReady = true;
+      });
+    </script>
+  </head>
+  <body>
+    <main>
+      <button id="go" type="button">Go</button>
+    </main>
+  </body>
+</html>

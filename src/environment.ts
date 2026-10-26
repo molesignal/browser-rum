@@ -1,34 +1,72 @@
 import type { NormalizedRumConfiguration } from './config.js';
-import { generateId } from './utils.js';
+import type { RumConnectivity } from './events.js';
+import { clampText, generateId, generateUuid } from './utils.js';
 
-export interface BrowserEnvironment {
-  browser?: string;
-  os?: string;
-  device?: string;
-  language?: string;
-  timezone?: string;
-  viewport?: string;
+export interface DeviceInfo {
+  locale?: string;
+  time_zone?: string;
 }
 
-export function readBrowserEnvironment(): BrowserEnvironment {
-  if (typeof navigator === 'undefined') return {};
-  const userAgent = navigator.userAgent ?? '';
-  const result: BrowserEnvironment = {
-    browser: browserName(userAgent),
-    os: operatingSystem(userAgent),
-    device: deviceType(userAgent),
-    language: navigator.language,
-  };
+const INTERFACES = new Set([
+  'bluetooth',
+  'cellular',
+  'ethernet',
+  'wifi',
+  'wimax',
+  'mixed',
+  'other',
+  'unknown',
+  'none',
+]);
+const EFFECTIVE_TYPES = new Set(['slow-2g', '2g', '3g', '4g']);
 
+interface NetworkInformationLike {
+  type?: string;
+  effectiveType?: string;
+}
+
+/**
+ * The browser and operating system are not collected here: the server derives
+ * `browser`, `os` and `device` from the User-Agent header with a real parser.
+ */
+export function readDeviceInfo(): DeviceInfo {
+  const device: DeviceInfo = {};
+  if (typeof navigator !== 'undefined' && navigator.language) {
+    device.locale = clampText(navigator.language, 256);
+  }
   try {
-    result.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (timeZone) device.time_zone = clampText(timeZone, 256);
   } catch {
     // Intl data is optional in embedded browsers.
   }
-  if (typeof window !== 'undefined') {
-    result.viewport = `${window.innerWidth}x${window.innerHeight}`;
+  return device;
+}
+
+export function readConnectivity(): RumConnectivity | undefined {
+  if (typeof navigator === 'undefined') return undefined;
+  const connectivity: RumConnectivity = {
+    status: navigator.onLine === false ? 'not_connected' : 'connected',
+  };
+  const connection = (navigator as Navigator & { connection?: NetworkInformationLike })
+    .connection;
+  if (connection) {
+    if (connection.type && INTERFACES.has(connection.type)) {
+      connectivity.interfaces = [connection.type as NonNullable<RumConnectivity['interfaces']>[number]];
+    }
+    if (connection.effectiveType && EFFECTIVE_TYPES.has(connection.effectiveType)) {
+      connectivity.effective_type = connection.effectiveType as RumConnectivity['effective_type'];
+    }
   }
-  return removeEmpty(result);
+  return connectivity;
+}
+
+export function readViewport(): { width: number; height: number } | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return undefined;
+  return { width: Math.max(0, width), height: Math.max(0, height) };
 }
 
 export function getAnonymousUserId(config: NormalizedRumConfiguration): string | undefined {
@@ -46,47 +84,48 @@ export function getAnonymousUserId(config: NormalizedRumConfiguration): string |
 }
 
 export function clearAnonymousUserId(config: NormalizedRumConfiguration): void {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.removeItem(
-      `molesignal_rum_anonymous_${storageKey(config.applicationId)}`,
-    );
-  } catch {
-    // Storage can be denied in private contexts.
+  removeItem(
+    typeof localStorage === 'undefined' ? undefined : localStorage,
+    `molesignal_rum_anonymous_${storageKey(config.applicationId)}`,
+  );
+}
+
+/**
+ * An identifier for this browser tab. `sessionStorage` is per tab and survives
+ * reloads, so a reloaded page keeps its `tab.id`.
+ */
+export function getTabId(config: NormalizedRumConfiguration): string {
+  const key = `molesignal_rum_tab_${storageKey(config.applicationId)}`;
+  if (typeof sessionStorage !== 'undefined') {
+    try {
+      const existing = sessionStorage.getItem(key);
+      if (existing && /^[A-Za-z0-9._:-]{1,128}$/.test(existing)) return existing;
+      const created = generateUuid();
+      sessionStorage.setItem(key, created);
+      return created;
+    } catch {
+      // Storage can be denied in private contexts; fall through to a per-load id.
+    }
   }
+  return generateUuid();
 }
 
-function browserName(userAgent: string): string | undefined {
-  if (/Edg\//.test(userAgent)) return 'Edge';
-  if (/OPR\//.test(userAgent)) return 'Opera';
-  if (/Firefox\/|FxiOS\//.test(userAgent)) return 'Firefox';
-  if (/Chrome\/|CriOS\//.test(userAgent)) return 'Chrome';
-  if (/Safari\//.test(userAgent) && /Version\//.test(userAgent)) return 'Safari';
-  return undefined;
+export function clearTabId(config: NormalizedRumConfiguration): void {
+  removeItem(
+    typeof sessionStorage === 'undefined' ? undefined : sessionStorage,
+    `molesignal_rum_tab_${storageKey(config.applicationId)}`,
+  );
 }
 
-function operatingSystem(userAgent: string): string | undefined {
-  if (/Android/.test(userAgent)) return 'Android';
-  if (/iPhone|iPad|iPod/.test(userAgent)) return 'iOS';
-  if (/Windows NT/.test(userAgent)) return 'Windows';
-  if (/Mac OS X/.test(userAgent)) return 'macOS';
-  if (/Linux/.test(userAgent)) return 'Linux';
-  return undefined;
-}
-
-function deviceType(userAgent: string): string {
-  if (/iPad|Tablet|PlayBook|Silk/i.test(userAgent)) return 'tablet';
-  if (/Mobi|Android|iPhone|iPod/i.test(userAgent)) return 'mobile';
-  return 'desktop';
-}
-
-function storageKey(value: string): string {
+export function storageKey(value: string): string {
   return value.replace(/[^\w.-]/g, '_').slice(0, 80);
 }
 
-function removeEmpty<T extends object>(value: T): T {
-  for (const key of Object.keys(value) as Array<keyof T>) {
-    if (value[key] === undefined || value[key] === '') delete value[key];
+function removeItem(storage: Storage | undefined, key: string): void {
+  if (!storage) return;
+  try {
+    storage.removeItem(key);
+  } catch {
+    // Storage can be denied in private contexts.
   }
-  return value;
 }

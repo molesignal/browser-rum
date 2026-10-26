@@ -8,7 +8,8 @@
       {
         "imports": {
           "@rrweb/record": "/node_modules/@rrweb/record/dist/record.js",
-          "web-vitals": "/node_modules/web-vitals/dist/web-vitals.js"
+          "web-vitals": "/node_modules/web-vitals/dist/web-vitals.js",
+          "web-vitals/attribution": "/node_modules/web-vitals/dist/web-vitals.attribution.js"
         }
       }
     </script>
@@ -22,8 +23,14 @@
       >
         Checkout
       </button>
+      <button id="dead-button" type="button">Does nothing</button>
+      <button id="rage-button" type="button">Click me hard</button>
+      <button id="busy-button" type="button">Block the main thread</button>
+      <button id="fetch-button" type="button">Load data</button>
+      <button id="error-button" type="button">Break</button>
       <input id="password" value="super-secret-input-value" />
       <div id="mutation-target">Initial</div>
+      <img id="hero" alt="" width="120" height="60" src="/__rum/pixel.png?hero=1" />
     </main>
     <script type="module">
       import { initRum } from '/dist/index.js';
@@ -38,6 +45,7 @@
           site: window.location.origin,
           service: 'browser-e2e-web',
           version: '1.0.0-e2e',
+          debugId: 'e2e-build-1',
           trackViewsManually: true,
           trackUserInteractions: true,
           trackFrustrations: false,
@@ -52,6 +60,73 @@
         });
         return true;
       };
+
+      // Behaviors the tests trigger by clicking.
+      const on = (id, handler) => document.getElementById(id).addEventListener('click', handler);
+      on('busy-button', () => {
+        const until = performance.now() + 250;
+        while (performance.now() < until) {
+          // Block the main thread: a long task.
+        }
+      });
+      on('fetch-button', async () => {
+        const response = await fetch('/__rum/json?delay=60&size=2048');
+        await response.text();
+        document.getElementById('mutation-target').textContent = `loaded ${response.status}`;
+      });
+      on('error-button', () => {
+        throw new TypeError('click failure');
+      });
+      on('rage-button', () => undefined);
+
+      // Failures the tests trigger from here, so that stack frames point at this page.
+      window.fixture = {
+        throwUncaught() {
+          setTimeout(function payFailure() {
+            throw new TypeError('uncaught boom');
+          }, 0);
+        },
+        throwWithCause() {
+          setTimeout(function cartFailure() {
+            throw new Error('outer failure', { cause: new Error('inner failure') });
+          }, 0);
+        },
+        rejectUnhandled() {
+          Promise.reject(new RangeError('rejected boom'));
+        },
+        consoleError() {
+          console.error(new Error('console boom'));
+        },
+        failXhr() {
+          return new Promise((resolve) => {
+            const request = new XMLHttpRequest();
+            request.open('GET', '/__rum/json?status=404');
+            request.onloadend = resolve;
+            request.send();
+          });
+        },
+        loadBrokenScript() {
+          const script = document.createElement('script');
+          script.src = '/__rum/missing-script.js';
+          document.head.append(script);
+        },
+        violateCsp() {
+          document.dispatchEvent(
+            new SecurityPolicyViolationEvent('securitypolicyviolation', {
+              blockedURI: 'https://evil.example/inject.js?token=1',
+              effectiveDirective: 'script-src',
+              disposition: 'enforce',
+            }),
+          );
+        },
+        async failRequests() {
+          await fetch('/__rum/json?status=500')
+            .then((response) => response.text())
+            .catch(() => undefined);
+          await fetch('/aborted-request').catch(() => undefined);
+        },
+      };
+
       window.fixtureReady = true;
     </script>
   </body>

@@ -12,11 +12,29 @@ export class ReplayRecorder {
   private stopRecording?: StopRecording;
   private readyListener?: () => void;
   private generation = 0;
+  private recording = false;
 
   constructor(
     private readonly config: NormalizedRumConfiguration,
     private readonly emit: (sessionId: string, event: RumContext) => void,
+    /** Called when DOM events actually start or stop being captured. */
+    private readonly onRecordingChange: (recording: boolean) => void = () => undefined,
   ) {}
+
+  /** True while rrweb is capturing the page, not merely requested to. */
+  isRecording(): boolean {
+    return this.recording;
+  }
+
+  private setRecording(recording: boolean): void {
+    if (this.recording === recording) return;
+    this.recording = recording;
+    try {
+      this.onRecordingChange(recording);
+    } catch (error) {
+      reportInternalError(this.config.onError, error, 'RUM replay state callback failed');
+    }
+  }
 
   start(sessionId: string): void {
     if (this.sessionId === sessionId) return;
@@ -86,7 +104,10 @@ export class ReplayRecorder {
           reportInternalError(this.config.onError, error, 'RUM replay recorder failed');
         },
       });
-      if (typeof stop === 'function') this.stopRecording = stop;
+      if (typeof stop === 'function') {
+        this.stopRecording = stop;
+        this.setRecording(true);
+      }
     } catch (error) {
       this.sessionId = undefined;
       reportInternalError(this.config.onError, error, 'RUM replay recorder failed to start');
@@ -103,6 +124,7 @@ export class ReplayRecorder {
     const stop = this.stopRecording;
     this.stopRecording = undefined;
     this.sessionId = undefined;
+    this.setRecording(false);
     if (!stop) return;
     try {
       stop();

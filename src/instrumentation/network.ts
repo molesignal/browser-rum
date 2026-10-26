@@ -1,5 +1,5 @@
+import { perfNow } from '../clock.js';
 import {
-  durationNow,
   generateTraceparent,
   parseTraceparent,
   traceparentFromServerTiming,
@@ -7,22 +7,55 @@ import {
 import type { TraceContext } from '../utils.js';
 import type { Cleanup, InstrumentationHooks } from './types.js';
 
-interface RequestMetadata {
+export type RequestKind = 'fetch' | 'xhr';
+
+/** One fetch or XMLHttpRequest, from the call that started it to its outcome. */
+export interface RequestRecord {
+  kind: RequestKind;
   method: string;
+  /** The absolute URL, as requested (not sanitized). */
   url: string;
-  startedAt: number;
-  traceparent?: string;
-  tracked: boolean;
+  /** `performance.now()` when the request was issued. */
+  startRel: number;
+  /** Epoch milliseconds when the request was issued. */
+  startDate: number;
+  /** `performance.now()` when the response arrived or the request failed. */
+  endRel?: number;
+  status?: number;
+  statusText?: string;
+  /** The request failed before any response (offline, DNS, CORS, ...). */
+  failed?: boolean;
+  /** The request was cancelled by the application. */
+  aborted?: boolean;
+  /** The name of the error thrown by `fetch`, such as `TypeError`. */
+  errorName?: string;
+  errorMessage?: string;
+  trace?: TraceContext;
 }
 
-export function instrumentNetwork(hooks: InstrumentationHooks): Cleanup {
-  const cleanups = [instrumentFetch(hooks), instrumentXhr(hooks)];
+export interface RequestListener {
+  /** A request is about to be sent. */
+  started(record: RequestRecord): void;
+  /** The response headers arrived (fetch) or the request ended (XHR). */
+  finished(record: RequestRecord): void;
+}
+
+/**
+ * Wraps `fetch` and `XMLHttpRequest`. It injects a W3C `traceparent` where
+ * that is allowed, reads the trace context back from the request or response,
+ * and tells `listener` what happened.
+ */
+export function instrumentNetwork(
+  hooks: InstrumentationHooks,
+  listener: RequestListener,
+): Cleanup {
+  const cleanups = [instrumentFetch(hooks, listener), instrumentXhr(hooks, listener)];
   return () => {
     for (const cleanup of cleanups.reverse()) cleanup();
   };
 }
 
-function instrumentFetch(hooks: InstrumentationHooks): Cleanup {
+function instrumentFetch(hooks: InstrumentationHooks, listener: RequestListener): Cleanup {
   if (typeof window.fetch !== 'function') return () => undefined;
   const originalFetch = window.fetch;
 
@@ -32,53 +65,49 @@ function instrumentFetch(hooks: InstrumentationHooks): Cleanup {
     init?: RequestInit,
   ): Promise<Response> {
     const url = resolveRequestUrl(input);
-    if (!url || hooks.isSdkUrl(url) || !hooks.shouldTrackUrl(url)) {
+    if (!isTrackable(url, hooks)) {
       return originalFetch.call(this, input, init);
     }
 
-    const method = resolveRequestMethod(input, init);
+    const traced = hooks.config.trackResources && hooks.shouldReadTrace(url);
     let requestTraceparent = readRequestHeader(input, init, 'traceparent');
     let tracedInput = input;
     let tracedInit = init;
-    if (hooks.shouldReadTrace(url) && !requestTraceparent) {
+    if (traced && !requestTraceparent) {
       requestTraceparent = generateTraceparent();
-      [tracedInput, tracedInit] = injectFetchTraceparent(
-        input,
-        init,
-        requestTraceparent,
-      );
+      [tracedInput, tracedInit] = injectFetchTraceparent(input, init, requestTraceparent);
     }
-    const startedAt = durationNow();
-    hooks.markActivity();
-    hooks.markChange();
+
+    const record: RequestRecord = {
+      kind: 'fetch',
+      method: resolveRequestMethod(input, init),
+      url,
+      startRel: perfNow(),
+      startDate: Date.now(),
+      trace: traced ? parseTraceparent(requestTraceparent) : undefined,
+    };
+    listener.started(record);
 
     try {
       const response = await originalFetch.call(this, tracedInput, tracedInit);
-      const traceContext = hooks.shouldReadTrace(url)
-        ? responseTraceContext(response, requestTraceparent)
-        : undefined;
-      recordRequest(hooks, {
-        method,
-        url,
-        durationMs: durationNow() - startedAt,
-        status: response.status,
-        traceContext,
-        initiator: 'fetch',
-        responseSize: numericHeader(response.headers, 'content-length'),
-      });
+      record.endRel = perfNow();
+      record.status = response.status;
+      record.statusText = response.statusText || undefined;
+      if (traced) record.trace = responseTraceContext(response, requestTraceparent);
+      listener.finished(record);
       return response;
     } catch (error) {
-      recordRequest(hooks, {
-        method,
-        url,
-        durationMs: durationNow() - startedAt,
-        status: 599,
-        traceContext: hooks.shouldReadTrace(url)
-          ? parseTraceparent(requestTraceparent)
-          : undefined,
-        initiator: 'fetch',
-        error: error instanceof Error ? error.message : String(error),
-      });
+      record.endRel = perfNow();
+      record.failed = true;
+      record.status = 0;
+      record.aborted = isAbortError(error);
+      if (error instanceof Error) {
+        record.errorName = error.name;
+        record.errorMessage = error.message;
+      } else {
+        record.errorMessage = String(error);
+      }
+      listener.finished(record);
       throw error;
     }
   };
@@ -89,13 +118,21 @@ function instrumentFetch(hooks: InstrumentationHooks): Cleanup {
   };
 }
 
-function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
+interface XhrState {
+  record?: RequestRecord;
+  method: string;
+  url: string;
+  tracked: boolean;
+  traceparent?: string;
+}
+
+function instrumentXhr(hooks: InstrumentationHooks, listener: RequestListener): Cleanup {
   if (typeof XMLHttpRequest === 'undefined') return () => undefined;
   const prototype = XMLHttpRequest.prototype;
   const originalOpen = prototype.open;
   const originalSend = prototype.send;
   const originalSetRequestHeader = prototype.setRequestHeader;
-  const requests = new WeakMap<XMLHttpRequest, RequestMetadata>();
+  const requests = new WeakMap<XMLHttpRequest, XhrState>();
 
   const wrappedOpen = function (
     this: XMLHttpRequest,
@@ -107,12 +144,9 @@ function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
   ): void {
     const absoluteUrl = resolveUrl(String(url));
     requests.set(this, {
-      method: method.toUpperCase(),
+      method: String(method).toUpperCase(),
       url: absoluteUrl,
-      startedAt: 0,
-      tracked:
-        !hooks.isSdkUrl(absoluteUrl) &&
-        hooks.shouldTrackUrl(absoluteUrl),
+      tracked: isTrackable(absoluteUrl, hooks),
     });
     originalOpen.call(this, method, url, async, username ?? null, password ?? null);
   };
@@ -122,8 +156,8 @@ function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
     name: string,
     value: string,
   ): void {
-    const metadata = requests.get(this);
-    if (metadata && name.toLowerCase() === 'traceparent') metadata.traceparent = value;
+    const state = requests.get(this);
+    if (state && name.toLowerCase() === 'traceparent') state.traceparent = value;
     originalSetRequestHeader.call(this, name, value);
   };
 
@@ -131,57 +165,50 @@ function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
     this: XMLHttpRequest,
     body?: Document | XMLHttpRequestBodyInit | null,
   ): void {
-    const metadata = requests.get(this);
-    if (!metadata?.tracked) {
+    const state = requests.get(this);
+    if (!state?.tracked) {
       originalSend.call(this, body ?? null);
       return;
     }
 
-    metadata.startedAt = durationNow();
-    hooks.markActivity();
-    hooks.markChange();
-    if (hooks.shouldReadTrace(metadata.url) && !metadata.traceparent) {
-      metadata.traceparent = generateTraceparent();
+    const traced = hooks.config.trackResources && hooks.shouldReadTrace(state.url);
+    if (traced && !state.traceparent) {
+      state.traceparent = generateTraceparent();
       try {
-        originalSetRequestHeader.call(this, 'traceparent', metadata.traceparent);
+        originalSetRequestHeader.call(this, 'traceparent', state.traceparent);
       } catch {
         // The request still proceeds if a browser refuses trace header injection.
-        metadata.traceparent = undefined;
+        state.traceparent = undefined;
       }
     }
-    const onLoadEnd = (): void => {
-      let responseTraceparent: string | null = null;
-      let serverTiming: string | null = null;
-      let responseSize: number | undefined;
-      try {
-        responseTraceparent = this.getResponseHeader('traceparent');
-        serverTiming = this.getResponseHeader('server-timing');
-        const contentLength = this.getResponseHeader('content-length');
-        if (contentLength) {
-          const parsed = Number(contentLength);
-          if (Number.isFinite(parsed)) responseSize = parsed;
-        }
-      } catch {
-        // Cross-origin XHR may not expose response headers.
-      }
-      const traceContext = hooks.shouldReadTrace(metadata.url)
-        ? parseTraceparent(
-            responseTraceparent ??
-              traceparentFromServerTiming(serverTiming) ??
-              metadata.traceparent,
-          )
-        : undefined;
-      recordRequest(hooks, {
-        method: metadata.method,
-        url: metadata.url,
-        durationMs: durationNow() - metadata.startedAt,
-        status: this.status || 599,
-        traceContext,
-        initiator: 'xmlhttprequest',
-        responseSize,
-      });
+    const record: RequestRecord = {
+      kind: 'xhr',
+      method: state.method,
+      url: state.url,
+      startRel: perfNow(),
+      startDate: Date.now(),
+      trace: traced ? parseTraceparent(state.traceparent) : undefined,
     };
-    this.addEventListener('loadend', onLoadEnd, { once: true });
+    state.record = record;
+    listener.started(record);
+
+    let aborted = false;
+    this.addEventListener('abort', () => {
+      aborted = true;
+    });
+    this.addEventListener(
+      'loadend',
+      () => {
+        record.endRel = perfNow();
+        record.status = this.status;
+        record.statusText = this.statusText || undefined;
+        record.aborted = aborted;
+        record.failed = this.status === 0;
+        if (traced) record.trace = xhrTraceContext(this, state.traceparent);
+        listener.finished(record);
+      },
+      { once: true },
+    );
     originalSend.call(this, body ?? null);
   };
 
@@ -198,41 +225,48 @@ function instrumentXhr(hooks: InstrumentationHooks): Cleanup {
   };
 }
 
-function recordRequest(
-  hooks: InstrumentationHooks,
-  input: {
-    method: string;
-    url: string;
-    durationMs: number;
-    status: number;
-    traceContext?: TraceContext;
-    initiator: string;
-    responseSize?: number;
-    error?: string;
-  },
-): void {
-  const sanitizedUrl = hooks.sanitizeUrl(input.url);
-  let path = sanitizedUrl;
+/** The trace of a finished XHR: the response, else `Server-Timing`, else what was sent. */
+function xhrTraceContext(
+  request: XMLHttpRequest,
+  requestTraceparent: string | undefined,
+): TraceContext | undefined {
+  let responseTraceparent: string | null = null;
+  let serverTiming: string | null = null;
   try {
-    const parsed = new URL(sanitizedUrl);
-    path = `${parsed.pathname}${parsed.search}`;
+    responseTraceparent = request.getResponseHeader('traceparent');
+    serverTiming = request.getResponseHeader('server-timing');
   } catch {
-    // Keep the sanitized value for non-standard URL schemes.
+    // Cross-origin XHR may not expose response headers.
   }
-  hooks.recordAction({
-    type: 'resource',
-    name: `${input.method} ${path}`,
-    url: sanitizedUrl,
-    durationMs: Math.max(0, input.durationMs),
-    status: input.status,
-    traceContext: input.traceContext,
-    context: {
-      method: input.method,
-      initiator: input.initiator,
-      response_size: input.responseSize,
-      error: input.error,
-    },
-  });
+  return parseTraceparent(
+    responseTraceparent ?? traceparentFromServerTiming(serverTiming) ?? requestTraceparent,
+  );
+}
+
+function responseTraceContext(
+  response: Response,
+  requestTraceparent: string | undefined,
+): TraceContext | undefined {
+  try {
+    const direct = response.headers.get('traceparent');
+    const serverTiming = traceparentFromServerTiming(response.headers.get('server-timing'));
+    return parseTraceparent(direct ?? serverTiming ?? requestTraceparent);
+  } catch {
+    return parseTraceparent(requestTraceparent);
+  }
+}
+
+/** Only http(s) requests that are not the SDK's own and not excluded by the application. */
+function isTrackable(url: string, hooks: InstrumentationHooks): boolean {
+  return /^https?:/i.test(url) && !hooks.isSdkUrl(url) && hooks.shouldTrackUrl(url);
+}
+
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: unknown }).name === 'AbortError'
+  );
 }
 
 function resolveRequestUrl(input: RequestInfo | URL): string {
@@ -286,30 +320,6 @@ function injectFetchTraceparent(
     return [input, { ...init, headers }];
   } catch {
     return [input, init];
-  }
-}
-
-function responseTraceContext(
-  response: Response,
-  requestTraceparent: string | undefined,
-): TraceContext | undefined {
-  try {
-    const direct = response.headers.get('traceparent');
-    const serverTiming = traceparentFromServerTiming(response.headers.get('server-timing'));
-    return parseTraceparent(direct ?? serverTiming ?? requestTraceparent);
-  } catch {
-    return parseTraceparent(requestTraceparent);
-  }
-}
-
-function numericHeader(headers: Headers, name: string): number | undefined {
-  try {
-    const value = headers.get(name);
-    if (!value) return undefined;
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
   }
 }
 

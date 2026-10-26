@@ -1,5 +1,7 @@
+import { normalizeAccount, normalizeUser } from './identity.js';
 import type {
   PrivacyLevel,
+  RumAccount,
   RumContext,
   RumInitConfiguration,
   RumSessionReplayConfiguration,
@@ -8,10 +10,15 @@ import type {
   TrackingConsent,
   UrlMatcher,
 } from './types.js';
+import { clampText, sanitizeContext } from './utils.js';
 
 const MIN_FLUSH_INTERVAL = 250;
 const MAX_FLUSH_INTERVAL = 60_000;
 const MIN_SESSION_TIMEOUT = 60_000;
+const IDENTIFIER_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+const DEFAULT_SESSION_INACTIVITY_TIMEOUT = 15 * 60_000;
+const DEFAULT_MAX_SESSION_DURATION = 4 * 60 * 60_000;
 
 export interface NormalizedRumConfiguration {
   applicationId: string;
@@ -22,6 +29,7 @@ export interface NormalizedRumConfiguration {
   version?: string;
   debugId?: string;
   user?: RumUser;
+  account?: RumAccount;
   globalContext: RumContext;
   trackingConsent: TrackingConsent;
 
@@ -35,6 +43,7 @@ export interface NormalizedRumConfiguration {
   trackWebVitals: boolean;
   trackConsoleErrors: boolean;
   trackViewsManually: boolean;
+  trackBfcacheViews: boolean;
   trackAnonymousUser: boolean;
   trackUrlQueryString: boolean;
   defaultPrivacyLevel: PrivacyLevel;
@@ -52,6 +61,9 @@ export interface NormalizedRumConfiguration {
   retryMaxDelay: number;
   sessionInactivityTimeout: number;
   maxSessionDuration: number;
+  sessionCookieDomain?: string;
+  trackSessionAcrossSubdomains: boolean;
+  useCrossSiteSessionCookie: boolean;
 
   beforeSend?: RumInitConfiguration['beforeSend'];
   onError?: RumInitConfiguration['onError'];
@@ -64,11 +76,11 @@ export function normalizeConfiguration(
   if (!config || typeof config !== 'object') {
     throw new TypeError('MoleSignal RUM configuration is required');
   }
-  const applicationId = requiredString(config.applicationId, 'applicationId');
+  const applicationId = normalizeApplicationId(config.applicationId);
   const clientToken = normalizeClientToken(config.clientToken);
   const site = normalizeSite(requiredString(config.site, 'site'));
   const trackUserInteractions = config.trackUserInteractions ?? false;
-  const version = cleanOptionalString(config.version);
+  const version = cleanLabel(config.version);
   const debugId = normalizeDebugId(config.debugId);
   if (debugId && !version) {
     throw new TypeError('MoleSignal RUM "version" is required when "debugId" is set');
@@ -79,12 +91,13 @@ export function normalizeConfiguration(
     applicationId,
     clientToken,
     site,
-    service: cleanOptionalString(config.service) ?? applicationId,
-    env: cleanOptionalString(config.env),
+    service: cleanLabel(config.service) ?? clampText(applicationId, 256),
+    env: cleanLabel(config.env),
     version,
     debugId,
-    user: normalizeUser(config.user),
-    globalContext: { ...(config.globalContext ?? {}) },
+    user: config.user ? normalizeUser(config.user) : undefined,
+    account: config.account ? normalizeAccount(config.account) : undefined,
+    globalContext: sanitizeContext(config.globalContext ?? {}),
     trackingConsent: normalizeTrackingConsent(config.trackingConsent),
 
     sessionSampleRate: normalizeRate(config.sessionSampleRate, 100),
@@ -97,6 +110,7 @@ export function normalizeConfiguration(
     trackWebVitals: config.trackWebVitals ?? true,
     trackConsoleErrors: config.trackConsoleErrors ?? false,
     trackViewsManually: config.trackViewsManually ?? false,
+    trackBfcacheViews: config.trackBfcacheViews ?? false,
     trackAnonymousUser: config.trackAnonymousUser ?? true,
     trackUrlQueryString: config.trackUrlQueryString ?? false,
     defaultPrivacyLevel: config.defaultPrivacyLevel ?? 'mask',
@@ -129,16 +143,19 @@ export function normalizeConfiguration(
     ),
     sessionInactivityTimeout: clampInteger(
       config.sessionInactivityTimeout,
-      30 * 60_000,
+      DEFAULT_SESSION_INACTIVITY_TIMEOUT,
       MIN_SESSION_TIMEOUT,
       24 * 60 * 60_000,
     ),
     maxSessionDuration: clampInteger(
       config.maxSessionDuration,
-      4 * 60 * 60_000,
+      DEFAULT_MAX_SESSION_DURATION,
       MIN_SESSION_TIMEOUT,
       24 * 60 * 60_000,
     ),
+    sessionCookieDomain: normalizeCookieDomain(config.sessionCookieDomain),
+    trackSessionAcrossSubdomains: config.trackSessionAcrossSubdomains ?? false,
+    useCrossSiteSessionCookie: config.useCrossSiteSessionCookie ?? false,
 
     beforeSend: config.beforeSend,
     onError: config.onError,
@@ -185,10 +202,12 @@ function normalizeSelector(value: string | undefined, fallback: string, field: s
   return selector;
 }
 
-export function rumEndpoint(
-  site: string,
-  kind: 'sessions' | 'actions' | 'errors' | 'replay',
-): string {
+/**
+ * The URL of the event or replay endpoint for a `site`, which may be an
+ * origin or end in `/api`, `/api/v1` or `/api/v1/rum`. Events go to
+ * `…/api/v1/rum/events`, DOM recordings to `…/api/v1/rum/replay`.
+ */
+export function rumEndpoint(site: string, kind: 'events' | 'replay'): string {
   const url = new URL(site);
   let path = url.pathname.replace(/\/+$/, '');
 
@@ -231,6 +250,16 @@ function requiredString(value: unknown, field: string): string {
   return value.trim();
 }
 
+function normalizeApplicationId(value: unknown): string {
+  const applicationId = requiredString(value, 'applicationId');
+  if (!IDENTIFIER_PATTERN.test(applicationId)) {
+    throw new TypeError(
+      'MoleSignal RUM "applicationId" must be 1 to 128 characters from A-Z a-z 0-9 . _ : -',
+    );
+  }
+  return applicationId;
+}
+
 function normalizeClientToken(value: unknown): string {
   const token = requiredString(value, 'clientToken');
   if (!/^msrum_[0-9A-Za-z]{16}_[0-9A-Za-z]{32}$/.test(token)) {
@@ -260,17 +289,23 @@ function normalizeDebugId(value: unknown): string | undefined {
   return debugId;
 }
 
+function normalizeCookieDomain(value: unknown): string | undefined {
+  const domain = cleanOptionalString(value);
+  if (!domain) return undefined;
+  if (domain.length > 253 || !/^\.?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$/.test(domain)) {
+    throw new TypeError('MoleSignal RUM "sessionCookieDomain" is not a valid domain');
+  }
+  return domain;
+}
+
 function cleanOptionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function normalizeUser(user: RumUser | undefined): RumUser | undefined {
-  if (!user) return undefined;
-  const id = cleanOptionalString(user.id);
-  if (!id) {
-    throw new TypeError('MoleSignal RUM user.id must be a non-empty string');
-  }
-  return { ...user, id };
+/** `service`, `env` and `version` are contract labels of 1 to 256 characters. */
+function cleanLabel(value: unknown): string | undefined {
+  const label = cleanOptionalString(value);
+  return label === undefined ? undefined : clampText(label, 256);
 }
 
 function normalizeRate(value: number | undefined, fallback: number): number {

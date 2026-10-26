@@ -1,161 +1,386 @@
+import {
+  epochToRelative,
+  perfNow,
+  relativeToEpoch,
+  timeOriginEpoch,
+  toNanoseconds,
+} from './clock.js';
 import type { NormalizedRumConfiguration } from './config.js';
+import { ContextStore } from './context.js';
 import {
   clearAnonymousUserId,
+  clearTabId,
   getAnonymousUserId,
-  readBrowserEnvironment,
+  getTabId,
+  readDeviceInfo,
 } from './environment.js';
-import { describeError } from './instrumentation/errors.js';
-import { instrumentErrors } from './instrumentation/errors.js';
-import { instrumentInteractions } from './instrumentation/interactions.js';
+import type { RumViewLoadingType } from './events.js';
+import { ErrorRecorder, captureHandlingStack, instrumentErrors } from './instrumentation/errors.js';
+import { instrumentClicks, type ClickTracker } from './instrumentation/clicks.js';
+import { instrumentLongTasks, type LongTaskTracker } from './instrumentation/long-tasks.js';
 import { instrumentNetwork } from './instrumentation/network.js';
-import {
-  instrumentPerformance,
-  type PerformanceInstrumentation,
-} from './instrumentation/performance.js';
-import type {
-  ActionInput,
-  Cleanup,
-  InstrumentationHooks,
-} from './instrumentation/types.js';
-import { instrumentViews } from './instrumentation/views.js';
-import { type RumSession, SessionManager } from './session.js';
+import { createResourceCollector, type ResourceCollector } from './instrumentation/resources.js';
+import { instrumentRoutes } from './instrumentation/routes.js';
+import type { Cleanup, InstrumentationHooks } from './instrumentation/types.js';
+import { instrumentWebVitals } from './instrumentation/web-vitals.js';
+import { EventPipeline } from './pipeline.js';
 import { ReplayRecorder } from './replay/recorder.js';
+import { ReplaySequence } from './replay/sequence.js';
+import { SessionManager, type SessionChange } from './session/manager.js';
+import { createSessionStore, type SessionState } from './session/store.js';
 import { EventTransport } from './transport.js';
 import type {
+  AddDurationVitalOptions,
+  AddErrorOptions,
+  DurationVitalOptions,
+  DurationVitalReference,
+  RumAccount,
   RumClient,
   RumContext,
-  RumEventKind,
   RumInternalContext,
   RumTransportStats,
   RumUser,
+  StartViewOptions,
+  StopDurationVitalOptions,
   TrackingConsent,
 } from './types.js';
 import {
-  fnv1a,
+  clampText,
+  compact,
+  generateUuid,
   isBrowserEnvironment,
   matchesUrl,
-  nowMicros,
-  pagePath,
   reportInternalError,
   sanitizeContext,
   sanitizeUrl,
-  SDK_NAME,
-  SDK_VERSION,
+  sanitizeValue,
+  sanitizeViewUrl,
+  truncate,
+  viewPath,
 } from './utils.js';
+import { ActionHistory } from './view/history.js';
+import { trackLoadingTime } from './view/loading.js';
+import { PageActivityMonitor } from './view/page-activity.js';
+import { ViewState, ViewTracker } from './view/tracker.js';
+
+/** A route change this soon after a click is attributed to the click. */
+const INTERACTION_TO_VIEW_WINDOW_MS = 3_000;
+const MAX_CUSTOM_TIMINGS = 50;
+const MAX_FEATURE_FLAGS = 100;
+/** Numbers below this are `performance.now()` timestamps, above it epoch milliseconds. */
+const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1_000;
+
+interface PendingVital {
+  reference: DurationVitalReference;
+  startRel: number;
+  startDate: number;
+  context: RumContext;
+  description?: string;
+}
+
+/** Everything that exists only while the SDK is collecting: consent given, in a browser. */
+interface Runtime {
+  sessions: SessionManager;
+  transport: EventTransport;
+  views: ViewTracker;
+  pipeline: EventPipeline;
+  actions: ActionHistory;
+  activity: PageActivityMonitor;
+  replay: ReplayRecorder;
+  replaySequence: ReplaySequence;
+  hooks: InstrumentationHooks;
+  errors: ErrorRecorder;
+  tabId: string;
+  cleanups: Cleanup[];
+  resources?: ResourceCollector;
+  longTasks: LongTaskTracker;
+  clicks?: ClickTracker;
+  stopLoading?: () => void;
+  vitals: Map<string, PendingVital>;
+  documentCollected: boolean;
+  /** Set while an explicit `startView` creates the view the session change would. */
+  autoViewSuppressed: boolean;
+  /** When the user event that is renewing the session happened, if known. */
+  startHint?: number;
+}
 
 export class BrowserRumClient implements RumClient {
   private readonly browser = isBrowserEnvironment();
-  private sessionManager?: SessionManager;
-  private eventTransport?: EventTransport;
-  private replayRecorder?: ReplayRecorder;
-  private readonly browserEnvironment: RumContext;
-  private anonymousUserId?: string;
-  private user?: RumUser;
-  private globalContext: RumContext;
+  private readonly contexts: ContextStore;
+  private runtime?: Runtime;
   private trackingConsent: TrackingConsent;
   private consentTransition: Promise<void> = Promise.resolve();
-  private readonly cleanups: Cleanup[] = [];
-  private performanceInstrumentation?: PerformanceInstrumentation;
-  private currentViewUrl = '';
-  private currentViewName = '';
-  private changeId = 0;
   private stopped = false;
   private stopPromise?: Promise<void>;
-  private replayOverride?: boolean;
-  private readonly recentErrors = new Map<string, number>();
 
   constructor(private readonly config: NormalizedRumConfiguration) {
-    this.user = config.user ? ({ ...config.user } as RumUser) : undefined;
-    this.globalContext = { ...config.globalContext };
+    this.contexts = new ContextStore({
+      user: config.user,
+      account: config.account,
+      globalContext: config.globalContext,
+    });
     this.trackingConsent = config.trackingConsent;
-    this.browserEnvironment = this.browser
-      ? (readBrowserEnvironment() as RumContext)
-      : {};
-
     if (this.browser && this.trackingConsent === 'granted') this.activate();
   }
 
   setUser(user: RumUser): void {
-    if (!user || typeof user.id !== 'string' || !user.id.trim()) {
-      throw new TypeError('MoleSignal RUM user.id must be a non-empty string');
-    }
-    this.user = { ...sanitizeContext(user), id: user.id.trim() } as RumUser;
-    this.markSessionDirty();
-  }
-
-  clearUser(): void {
-    this.user = undefined;
-    this.markSessionDirty();
+    this.contexts.setUser(user);
+    this.refreshView();
   }
 
   getUser(): RumUser | undefined {
-    return this.user ? ({ ...this.user } as RumUser) : undefined;
+    return this.contexts.getUser();
+  }
+
+  setUserProperty(key: string, value: unknown): void {
+    this.contexts.setUserProperty(key, value);
+    this.refreshView();
+  }
+
+  removeUserProperty(key: string): void {
+    this.contexts.removeUserProperty(key);
+    this.refreshView();
+  }
+
+  clearUser(): void {
+    this.contexts.clearUser();
+    this.refreshView();
+  }
+
+  setAccount(account: RumAccount): void {
+    this.contexts.setAccount(account);
+    this.refreshView();
+  }
+
+  getAccount(): RumAccount | undefined {
+    return this.contexts.getAccount();
+  }
+
+  setAccountProperty(key: string, value: unknown): void {
+    this.contexts.setAccountProperty(key, value);
+    this.refreshView();
+  }
+
+  removeAccountProperty(key: string): void {
+    this.contexts.removeAccountProperty(key);
+    this.refreshView();
+  }
+
+  clearAccount(): void {
+    this.contexts.clearAccount();
+    this.refreshView();
   }
 
   setGlobalContext(context: RumContext): void {
-    this.globalContext = sanitizeContext(context);
-    this.markSessionDirty();
+    this.contexts.setGlobalContext(context);
+    this.refreshView();
   }
 
   setGlobalContextProperty(key: string, value: unknown): void {
-    if (!key.trim()) return;
-    this.globalContext[key] = value;
-    this.markSessionDirty();
+    this.contexts.setGlobalContextProperty(key, value);
+    this.refreshView();
   }
 
   removeGlobalContextProperty(key: string): void {
-    delete this.globalContext[key];
-    this.markSessionDirty();
+    this.contexts.removeGlobalContextProperty(key);
+    this.refreshView();
+  }
+
+  clearGlobalContext(): void {
+    this.contexts.clearGlobalContext();
+    this.refreshView();
   }
 
   getGlobalContext(): RumContext {
-    return { ...sanitizeContext(this.globalContext) };
+    return this.contexts.getGlobalContext();
   }
 
   addAction(name: string, context: RumContext = {}): void {
-    if (!name || !this.canTrack()) return;
-    this.recordAction({
-      type: 'custom',
-      name,
-      context,
-    });
-  }
-
-  addError(error: unknown, context: RumContext = {}): void {
-    if (!this.canTrack()) return;
-    this.recordError(error, context, 'manual');
-  }
-
-  startView(name?: string, context: RumContext = {}): void {
-    if (!this.canTrack()) return;
-    const url = this.sanitizeUrl(window.location.href);
-    const logicalName = name?.trim() || pagePath(url);
-
-    this.performanceInstrumentation?.startView(url);
-    this.currentViewUrl = url;
-    this.currentViewName = logicalName;
-    this.markChange();
-    this.recordAction({
-      type: 'view',
-      name: `View ${logicalName}`,
-      url,
-      context: {
-        ...context,
-        path: pagePath(url),
-        view_name: logicalName,
+    const runtime = this.live();
+    if (!runtime || typeof name !== 'string' || !name.trim()) return;
+    runtime.pipeline.record({
+      type: 'action',
+      date: Date.now(),
+      body: {
+        id: generateUuid(),
+        type: 'custom',
+        target: { name: truncate(name.trim(), 1_024) },
       },
+      context: sanitizeContext(context),
     });
+  }
+
+  addError(error: unknown, context: RumContext = {}, options?: AddErrorOptions): void {
+    const runtime = this.live();
+    if (!runtime) return;
+    runtime.errors.record({
+      error,
+      source: 'custom',
+      handling: 'handled',
+      handlingStack: captureHandlingStack(),
+      context,
+      fingerprint: options?.fingerprint,
+    });
+  }
+
+  addTiming(name: string, time?: number): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view || typeof name !== 'string') return;
+    const key = name.replace(/[^A-Za-z0-9_.@$-]/g, '_').slice(0, 128);
+    if (!key) return;
+    if (!(key in view.customTimings) && Object.keys(view.customTimings).length >= MAX_CUSTOM_TIMINGS) {
+      return;
+    }
+    const rel = time === undefined ? perfNow() : toRelative(time);
+    view.customTimings[key] = toNanoseconds(rel - view.startRel);
+    runtime.views.schedule(view);
+  }
+
+  addFeatureFlagEvaluation(key: string, value: unknown): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view || typeof key !== 'string' || !key.trim()) return;
+    if (!(key in view.featureFlags) && Object.keys(view.featureFlags).length >= MAX_FEATURE_FLAGS) {
+      return;
+    }
+    view.featureFlags = { ...view.featureFlags, [key]: sanitizeValue(value) };
+    runtime.views.schedule(view);
+  }
+
+  startView(nameOrOptions?: string | StartViewOptions, context?: RumContext): void {
+    const runtime = this.live();
+    if (!runtime) return;
+    const options = normalizeViewOptions(nameOrOptions, context);
+
+    runtime.autoViewSuppressed = true;
+    let session: SessionState;
+    try {
+      session = runtime.sessions.touch();
+    } finally {
+      runtime.autoViewSuppressed = false;
+    }
+    if (!session.tracked) return;
+
+    const current = runtime.views.current;
+    let loadingType: RumViewLoadingType = 'route_change';
+    if (!runtime.views.initial) loadingType = 'initial_load';
+    else if (!current || current.sessionId !== session.id) loadingType = 'session_renewal';
+    this.beginView(session, loadingType, options);
+  }
+
+  setViewName(name: string): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view || typeof name !== 'string' || !name.trim()) return;
+    view.name = clampText(name.trim(), 1_024);
+    runtime.views.schedule(view);
+  }
+
+  setViewContext(context: RumContext): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view) return;
+    view.context = sanitizeContext(context);
+    runtime.views.schedule(view);
+  }
+
+  setViewContextProperty(key: string, value: unknown): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view || typeof key !== 'string' || !key.trim()) return;
+    view.context = { ...view.context, ...sanitizeContext({ [key]: value }) };
+    runtime.views.schedule(view);
+  }
+
+  getViewContext(): RumContext {
+    return { ...(this.runtime?.views.current?.context ?? {}) };
+  }
+
+  startDurationVital(
+    name: string,
+    options: DurationVitalOptions = {},
+  ): DurationVitalReference | undefined {
+    const runtime = this.live();
+    if (!runtime || typeof name !== 'string' || !name.trim()) return undefined;
+    const reference: DurationVitalReference = {
+      id: generateUuid(),
+      name: clampText(name.trim(), 256),
+    };
+    runtime.vitals.set(reference.id, {
+      reference,
+      startRel: perfNow(),
+      startDate: Date.now(),
+      context: sanitizeContext(options.context ?? {}),
+      description: options.description,
+    });
+    return reference;
+  }
+
+  stopDurationVital(
+    nameOrReference: string | DurationVitalReference,
+    options: StopDurationVitalOptions = {},
+  ): void {
+    const runtime = this.live();
+    if (!runtime) return;
+    const pending = findPendingVital(runtime.vitals, nameOrReference);
+    if (!pending) return;
+    runtime.vitals.delete(pending.reference.id);
+
+    const stopRel = options.stopTime === undefined ? perfNow() : toRelative(options.stopTime);
+    this.recordVital(
+      runtime,
+      pending.reference.name,
+      pending.startRel,
+      pending.startDate,
+      Math.max(0, stopRel - pending.startRel),
+      { ...pending.context, ...sanitizeContext(options.context ?? {}) },
+      options.description ?? pending.description,
+    );
+  }
+
+  addDurationVital(name: string, options: AddDurationVitalOptions): void {
+    const runtime = this.live();
+    if (
+      !runtime ||
+      typeof name !== 'string' ||
+      !name.trim() ||
+      !options ||
+      !Number.isFinite(options.startTime) ||
+      !Number.isFinite(options.duration)
+    ) {
+      return;
+    }
+    const requestedRel = toRelative(options.startTime);
+    this.recordVital(
+      runtime,
+      clampText(name.trim(), 256),
+      // A start before the page loaded still belongs to the first view.
+      Math.max(0, requestedRel),
+      relativeToEpoch(requestedRel),
+      Math.max(0, options.duration),
+      sanitizeContext(options.context ?? {}),
+      options.description,
+    );
   }
 
   startSessionReplayRecording(): void {
-    if (!this.canTrack()) return;
-    this.replayOverride = true;
-    this.prepareSession();
+    const runtime = this.live();
+    if (!runtime) return;
+    const session = runtime.sessions.get();
+    if (!session?.tracked) return;
+    this.syncReplay(runtime.sessions.setReplay(2));
   }
 
   stopSessionReplayRecording(): void {
-    this.replayOverride = false;
-    this.replayRecorder?.stop();
+    const runtime = this.live();
+    if (!runtime) return;
+    runtime.sessions.setReplay(0);
+    runtime.replay.stop();
+  }
+
+  stopSession(): void {
+    this.live()?.sessions.end();
   }
 
   setTrackingConsent(consent: TrackingConsent): void {
@@ -168,18 +393,17 @@ export class BrowserRumClient implements RumClient {
     this.trackingConsent = consent;
 
     if (consent === 'not-granted') {
-      const transport = this.eventTransport;
-      const sessionManager = this.sessionManager;
-      this.deactivateInstrumentation();
-      this.eventTransport = undefined;
-      this.sessionManager = undefined;
-      this.replayRecorder = undefined;
-      this.anonymousUserId = undefined;
-      this.replayOverride = undefined;
-      this.recentErrors.clear();
-      sessionManager?.clear();
+      const runtime = this.runtime;
+      this.runtime = undefined;
+      this.contexts.anonymousId = undefined;
+      if (runtime) {
+        this.deactivate(runtime);
+        runtime.sessions.clear();
+        runtime.replaySequence.clear();
+      }
       clearAnonymousUserId(this.config);
-      const discard = transport?.discard() ?? Promise.resolve();
+      clearTabId(this.config);
+      const discard = runtime?.transport.discard() ?? Promise.resolve();
       this.consentTransition = Promise.all([this.consentTransition, discard]).then(
         () => undefined,
       );
@@ -196,47 +420,61 @@ export class BrowserRumClient implements RumClient {
   }
 
   getInternalContext(): RumInternalContext {
-    const session = this.sessionManager?.current();
-    const context: RumInternalContext = {
+    const runtime = this.runtime;
+    const granted = this.trackingConsent === 'granted';
+    const session = granted ? runtime?.sessions.get() : undefined;
+    const view = runtime?.views.current;
+    const action = runtime?.actions.current();
+    return compact({
       application_id: this.config.applicationId,
-      session_id:
-        this.trackingConsent === 'granted' && session?.sampled
-          ? session.id
-          : undefined,
-      user_id:
-        this.trackingConsent === 'granted' ? this.currentUserId() : undefined,
+      session_id: session?.tracked ? session.id : undefined,
+      user_id: granted ? (this.contexts.getUser()?.id ?? this.contexts.anonymousId) : undefined,
+      tab_id: granted ? runtime?.tabId : undefined,
       service: this.config.service,
       env: this.config.env,
       version: this.config.version,
-    };
-    return compact(context);
+      view:
+        granted && session?.tracked && view
+          ? compact({ id: view.id, url: view.url, name: view.name, referrer: view.referrer })
+          : undefined,
+      user_action: granted && action ? { id: action.id } : undefined,
+    });
   }
 
   getTransportStats(): RumTransportStats {
-    return this.eventTransport?.getStats() ?? emptyTransportStats();
+    return this.runtime?.transport.getStats() ?? emptyTransportStats();
+  }
+
+  onReady(callback: () => void): void {
+    try {
+      callback();
+    } catch (error) {
+      reportInternalError(this.config.onError, error, 'RUM onReady callback failed');
+    }
   }
 
   async flush(): Promise<void> {
-    if (!this.canTrack()) return;
-    this.performanceInstrumentation?.report();
-    this.reportCurrentSession();
-    await this.eventTransport?.flush(false);
+    const runtime = this.live();
+    if (!runtime) return;
+    this.drain(runtime);
+    runtime.views.flush();
+    await runtime.transport.flush(false);
   }
 
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
-    const transport = this.eventTransport;
-    this.performanceInstrumentation?.report();
-    const session = this.sessionManager?.current();
-    if (session?.sampled) {
-      this.sessionManager?.finish(session.id);
-      this.reportSession(session);
+    const runtime = this.runtime;
+    if (runtime) {
+      this.drain(runtime, true);
+      const view = runtime.views.current;
+      if (view) runtime.views.end(view);
+      runtime.views.flush();
+      this.deactivate(runtime);
     }
-    this.deactivateInstrumentation();
     this.stopped = true;
     this.stopPromise = (async () => {
       await this.consentTransition;
-      await transport?.stop();
+      await runtime?.transport.stop();
     })();
     return this.stopPromise;
   }
@@ -246,64 +484,123 @@ export class BrowserRumClient implements RumClient {
       !this.browser ||
       this.stopped ||
       this.trackingConsent !== 'granted' ||
-      this.eventTransport
+      this.runtime ||
+      this.config.sessionSampleRate <= 0
     ) {
       return;
     }
-    const sessionManager = new SessionManager(this.config);
-    const eventTransport = new EventTransport(this.config, (sessionId) =>
-      sessionManager.nextReplaySequence(sessionId),
+    const { config } = this;
+    const tabId = getTabId(config);
+    this.contexts.anonymousId = getAnonymousUserId(config);
+
+    const replaySequence = new ReplaySequence(config.applicationId);
+    const transport = new EventTransport(config, tabId, (sessionId) => replaySequence.next(sessionId));
+    const actions = new ActionHistory();
+    const activity = new PageActivityMonitor();
+    const views = new ViewTracker({
+      report: (view) => this.runtime?.pipeline.recordView(view),
+    });
+    const pipeline = new EventPipeline({
+      config,
+      contexts: this.contexts,
+      views,
+      actions,
+      device: readDeviceInfo(),
+      tabId: () => tabId,
+      transport: () => transport,
+      resolveView: (rel) => this.resolveView(rel),
+    });
+    const hooks: InstrumentationHooks = {
+      config,
+      activity,
+      actions,
+      record: (input) => pipeline.record(input),
+      findView: (rel) => views.find(rel),
+      initialView: () => views.initial ?? this.lazyInitialView(),
+      scheduleView: (view) => views.schedule(view),
+      findAction: (rel) => actions.find(rel),
+      userActivity: (eventRel) => this.userActivity(eventRel),
+      sanitizeUrl: (url) => this.sanitizeUrl(url),
+      isSdkUrl: (url) => transport.isSdkUrl(url),
+      shouldTrackUrl: (url) => !matchesUrl(url, config.excludedUrls),
+      shouldReadTrace: (url) => this.shouldReadTrace(url),
+    };
+    const sessions = new SessionManager(config, createSessionStore(config), (change) =>
+      this.onSessionChange(change),
     );
-    this.sessionManager = sessionManager;
-    this.eventTransport = eventTransport;
-    this.replayRecorder = new ReplayRecorder(this.config, (sessionId, event) => {
-      const prepared = this.applyReplayBeforeSend(event);
-      if (prepared) this.eventTransport?.enqueueReplay(sessionId, prepared);
-    });
-    this.anonymousUserId = getAnonymousUserId(this.config);
-    this.start();
+    const replay = new ReplayRecorder(
+      config,
+      (sessionId, event) => {
+        runtime.transport.enqueueReplay(sessionId, event);
+      },
+      (recording) => this.onReplayChange(recording),
+    );
+    const runtime: Runtime = {
+      sessions,
+      transport,
+      views,
+      pipeline,
+      actions,
+      activity,
+      replay,
+      replaySequence,
+      hooks,
+      errors: new ErrorRecorder(hooks),
+      tabId,
+      cleanups: [],
+      longTasks: { flush: () => 0, stop: () => undefined },
+      vitals: new Map(),
+      documentCollected: false,
+      autoViewSuppressed: false,
+    };
+    this.runtime = runtime;
+
+    transport.start();
+    sessions.touch();
+    this.install(runtime);
   }
 
-  private start(): void {
-    this.eventTransport?.start();
-    this.prepareSession();
-    if (this.config.sessionSampleRate <= 0) return;
+  private install(runtime: Runtime): void {
+    const { config } = this;
+    const { hooks, cleanups } = runtime;
 
-    const hooks = this.instrumentationHooks();
-    this.performanceInstrumentation = instrumentPerformance(hooks, {
-      trackWebVitals: this.config.trackWebVitals,
-      trackResources: this.config.trackResources,
-      trackLongTasks: this.config.trackLongTasks,
-      onError: this.config.onError,
-    });
+    cleanups.push(instrumentErrors(hooks, runtime.errors));
 
-    if (!this.config.trackViewsManually) {
-      this.startView();
-    } else {
-      this.currentViewUrl = this.sanitizeUrl(window.location.href);
-      this.currentViewName = pagePath(this.currentViewUrl);
+    const resources = createResourceCollector(hooks, runtime.errors);
+    runtime.resources = resources;
+    cleanups.push(instrumentNetwork(hooks, resources));
+    cleanups.push(() => resources.stop());
+
+    if (config.trackLongTasks) {
+      runtime.longTasks = instrumentLongTasks(hooks);
+      cleanups.push(() => runtime.longTasks.stop());
     }
-
-    if (!this.config.trackViewsManually) this.cleanups.push(instrumentViews(hooks));
-    this.cleanups.push(instrumentErrors(hooks, this.config.trackConsoleErrors));
-    if (this.config.trackResources) this.cleanups.push(instrumentNetwork(hooks));
-    if (this.config.trackUserInteractions) {
-      this.cleanups.push(
-        instrumentInteractions(hooks, {
-          trackFrustrations: this.config.trackFrustrations,
-          privacyLevel: this.config.defaultPrivacyLevel,
-          actionNameAttribute: this.config.actionNameAttribute,
-        }),
-      );
+    if (config.trackWebVitals) cleanups.push(instrumentWebVitals(hooks));
+    if (config.trackUserInteractions) {
+      const clicks = instrumentClicks(hooks, { resources, longTasks: runtime.longTasks });
+      runtime.clicks = clicks;
+      cleanups.push(() => clicks.stop());
     }
-    this.installLifecycleListeners();
+    if (!config.trackViewsManually) cleanups.push(instrumentRoutes(() => this.startView()));
+
+    this.installLifecycle(runtime);
+    this.installUserActivity(runtime);
+
+    if (runtime.views.initial && !runtime.documentCollected) {
+      runtime.documentCollected = true;
+      resources.collectDocument();
+    }
   }
 
-  private deactivateInstrumentation(): void {
-    this.replayRecorder?.stop();
-    this.performanceInstrumentation?.stop();
-    this.performanceInstrumentation = undefined;
-    for (const cleanup of this.cleanups.splice(0).reverse()) {
+  private deactivate(runtime: Runtime): void {
+    runtime.stopLoading?.();
+    runtime.stopLoading = undefined;
+    runtime.replay.stop();
+    runtime.views.stop();
+    runtime.activity.stop();
+    runtime.sessions.stop();
+    runtime.errors.clear();
+    for (const cleanup of runtime.cleanups.splice(0).reverse()) {
       try {
         cleanup();
       } catch (error) {
@@ -312,316 +609,267 @@ export class BrowserRumClient implements RumClient {
     }
   }
 
-  private instrumentationHooks(): InstrumentationHooks {
-    return {
-      recordAction: (input) => this.recordAction(input),
-      recordError: (error, context, source) => this.recordError(error, context, source),
-      startView: (name, context) => this.startView(name, context),
-      markActivity: () => {
-        this.prepareSession();
-      },
-      markChange: () => this.markChange(),
-      getChangeId: () => this.changeId,
-      currentPage: () => this.currentViewUrl,
-      sanitizeUrl: (url) => this.sanitizeUrl(url),
-      isSdkUrl: (url) => this.eventTransport?.isSdkUrl(url) ?? false,
-      shouldTrackUrl: (url) => !matchesUrl(url, this.config.excludedUrls),
-      shouldReadTrace: (url) => this.shouldReadTrace(url),
+  private installLifecycle(runtime: Runtime): void {
+    const leave = (): void => {
+      this.drain(runtime, true);
+      runtime.views.setForeground(false);
+      runtime.views.flush();
+      void runtime.transport.flush(true, true);
     };
-  }
-
-  private installLifecycleListeners(): void {
-    const flushKeepalive = (finishSession: boolean): void => {
-      if (!this.canTrack()) return;
-      this.performanceInstrumentation?.report();
-      const session = this.sessionManager?.current();
-      if (finishSession && session?.sampled) this.sessionManager?.finish(session.id);
-      this.reportCurrentSession();
-      void this.eventTransport?.flush(true);
-    };
-    const onPageHide = (): void => flushKeepalive(true);
+    const onPageHide = (): void => leave();
     const onVisibilityChange = (): void => {
-      if (document.visibilityState === 'hidden') flushKeepalive(true);
+      if (document.visibilityState === 'hidden') {
+        leave();
+      } else {
+        this.userActivity();
+        runtime.views.setForeground(true);
+      }
+    };
+    const onPageShow = (event: PageTransitionEvent): void => {
+      if (!event.persisted) return;
+      const session = runtime.sessions.touch();
+      if (this.config.trackBfcacheViews && session.tracked) {
+        this.beginView(session, 'bf_cache');
+      } else {
+        runtime.views.setForeground(true);
+      }
     };
     const onOnline = (): void => {
-      void this.eventTransport?.flush(false);
+      void runtime.transport.flush(false, true);
     };
     window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('pageshow', onPageShow);
     window.addEventListener('online', onOnline);
     document.addEventListener('visibilitychange', onVisibilityChange);
-    this.cleanups.push(() => {
+    runtime.cleanups.push(() => {
       window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('pageshow', onPageShow);
       window.removeEventListener('online', onOnline);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     });
   }
 
-  private recordAction(input: ActionInput): void {
-    if (!this.canTrack()) return;
-    const session = this.prepareSession();
-    if (!session?.sampled) return;
-    const timestamp = input.timestampMicros ?? nowMicros();
-    const page = this.currentViewUrl || this.fallbackPage();
-    const payload = compact({
-      ...sanitizeContext(this.globalContext),
-      ...sanitizeContext(input.context ?? {}),
-      path: page ? pagePath(page) : undefined,
-      application: this.config.applicationId,
-      environment: this.config.env,
-      version: this.config.version,
-      browser: this.browserEnvironment.browser,
-      os: this.browserEnvironment.os,
-      device: this.browserEnvironment.device,
-      user: this.user ? sanitizeContext(this.user) : undefined,
-    });
-    const event = compact({
-      ...this.commonFields(timestamp, session),
-      timestamp,
-      session_id: session.id,
-      ts_micros: timestamp,
-      type: input.type,
-      name: input.name,
-      page: page ? pagePath(page) : undefined,
-      url: input.url ? this.sanitizeUrl(input.url) : input.type === 'view' ? page : undefined,
-      duration_ms: finite(input.durationMs),
-      status: finite(input.status),
-      lcp_ms: finite(input.lcpMs),
-      fid_ms: finite(input.fidMs),
-      cls: finite(input.cls),
-      ttfb_ms: finite(input.ttfbMs),
-      trace_id: input.traceContext?.traceId,
-      parent_span_id: input.traceContext?.parentSpanId,
-      service: input.service ?? this.config.service,
-      payload,
-    });
-    if (this.enqueue('action', event)) {
-      const sessionPage = page ? pagePath(page) : undefined;
-      if (input.context?.source === 'web-vitals') {
-        this.sessionManager?.touchPage(session.id, sessionPage);
-      } else {
-        this.sessionManager?.recordAction(session.id, input.type, sessionPage);
-      }
-    }
-
-    if (this.isReplayEnabled(session)) {
-      this.recordReplay(
-        session,
-        compact({
-          type: input.type,
-          ts: Math.floor(timestamp / 1_000),
-          href: page,
-          url: input.url ? this.sanitizeUrl(input.url) : undefined,
-          name: input.name,
-          selector: stringValue(input.context?.selector),
-          duration_ms: finite(input.durationMs),
-          status: finite(input.status),
-          payload: sanitizeContext(input.context ?? {}),
-        }),
-      );
-    }
-  }
-
-  private recordError(error: unknown, context: RumContext = {}, source = 'unknown'): void {
-    if (!this.canTrack()) return;
-    const session = this.prepareSession();
-    if (!session?.sampled) return;
-    const details = describeError(error);
-    const stack = details.stack.map((frame) => ({
-      ...frame,
-      file: frame.file ? this.sanitizeUrl(frame.file) : undefined,
-      debug_id: this.config.debugId,
-    }));
-    const signature = [
-      details.type,
-      details.message,
-      ...stack.slice(0, 3).map((frame) =>
-        [frame.file, frame.function, frame.line, frame.column].join(':'),
-      ),
-    ].join('|');
-    const now = Date.now();
-    const previous = this.recentErrors.get(signature);
-    if (previous !== undefined && now - previous < 1_000) return;
-    this.recentErrors.set(signature, now);
-    this.pruneRecentErrors(now);
-
-    const timestamp = nowMicros();
-    const page = this.currentViewUrl || this.fallbackPage();
-    const fingerprint = `fp_${fnv1a(signature)}`;
-    const errorContext = {
-      ...sanitizeContext(this.globalContext),
-      ...sanitizeContext(context),
-      source,
-      page: page ? pagePath(page) : undefined,
+  /** User input keeps the session alive; one touch per second is enough. */
+  private installUserActivity(runtime: Runtime): void {
+    let lastTouch = 0;
+    const onActivity = (event: Event): void => {
+      const now = Date.now();
+      if (now - lastTouch < 1_000) return;
+      lastTouch = now;
+      this.userActivity(event.timeStamp);
     };
-    const event = compact({
-      ...this.commonFields(timestamp, session),
-      timestamp,
-      session_id: session.id,
-      user_id: this.currentUserId(),
-      fingerprint,
-      message: details.message,
-      page: page ? pagePath(page) : undefined,
-      url: page,
-      application: this.config.applicationId,
-      environment: this.config.env,
-      version: this.config.version,
-      release: this.config.version,
-      service: this.config.service,
-      platform: 'web',
-      runtime: 'browser',
-      debug_id: this.config.debugId,
-      error_type: details.type,
-      error: compact({
-        type: details.type,
-        message: details.message,
-        stack,
-        raw_stack:
-          this.config.defaultPrivacyLevel === 'allow' ? details.rawStack : undefined,
-        context: errorContext,
-      }),
-      context: errorContext,
-    });
-    if (this.enqueue('error', event)) {
-      this.sessionManager?.recordError(
-        session.id,
-        page ? pagePath(page) : undefined,
-      );
-    }
-    this.recordAction({
-      type: 'error',
-      name: details.message,
-      timestampMicros: timestamp,
-      context: {
-        fingerprint,
-        error_type: details.type,
-        source,
-      },
+    const options = { capture: true, passive: true } as const;
+    const events = ['click', 'keydown', 'touchstart', 'scroll'] as const;
+    for (const type of events) window.addEventListener(type, onActivity, options);
+    runtime.cleanups.push(() => {
+      for (const type of events) window.removeEventListener(type, onActivity, options);
     });
   }
 
-  private prepareSession(): RumSession | undefined {
-    if (!this.canTrack() || !this.sessionManager) return undefined;
-    const { session, created, previous } = this.sessionManager.ensure(true);
-    if (previous?.sampled && (!previous.reported || previous.dirty)) {
-      this.reportSession(previous);
+  private onSessionChange(change: SessionChange): void {
+    const runtime = this.runtime;
+    if (!runtime || this.stopped) return;
+    switch (change.type) {
+      case 'expired':
+      case 'ended':
+        this.endCurrentView(runtime);
+        this.syncReplay(undefined);
+        break;
+      case 'switched':
+        this.syncReplay(change.session);
+        if (!runtime.autoViewSuppressed) this.beginView(change.session, 'session_renewal');
+        break;
+      case 'started':
+        this.syncReplay(change.session);
+        if (!runtime.autoViewSuppressed) this.autoStartView(runtime, change.session);
+        break;
     }
-    if (created || previous) {
-      this.replayOverride = undefined;
-      this.recentErrors.clear();
-    }
-    const page = this.currentViewUrl || this.fallbackPage();
-    this.sessionManager.touchPage(session.id, page ? pagePath(page) : undefined);
-    if (this.isReplayEnabled(session)) this.replayRecorder?.start(session.id);
-    else this.replayRecorder?.stop();
-    if (session.sampled && !session.reported) this.reportSession(session);
-    return session;
   }
 
-  private reportSession(session: RumSession): void {
-    if (!session.sampled || !this.eventTransport) return;
-    const timestamp = nowMicros();
-    const page = this.currentViewUrl || this.fallbackPage();
-    const fallbackPage = page ? pagePath(page) : undefined;
-    const endedAtMicros = Math.max(session.startedAtMicros, session.lastActivityMicros);
-    const event = compact({
-      ...this.commonFields(timestamp, session),
-      timestamp,
-      session_id: session.id,
-      user_id: this.currentUserId(),
-      started_at: session.startedAtMicros,
-      started_at_micros: session.startedAtMicros,
-      ended_at_micros: endedAtMicros,
-      duration_ms: Math.max(
-        0,
-        Math.round((endedAtMicros - session.startedAtMicros) / 1_000),
-      ),
-      application: this.config.applicationId,
-      app_version: this.config.version,
-      environment: this.config.env,
-      version: this.config.version,
-      service: this.config.service,
-      landing_page: session.landingPage ?? fallbackPage,
-      last_page: session.lastPage ?? fallbackPage,
-      view_count: session.viewCount,
-      action_count: session.actionCount,
-      error_count: session.errorCount,
-      user: this.user ? sanitizeContext(this.user) : undefined,
-      context: sanitizeContext(this.globalContext),
+  /** The first view of a new session; with manual views the initial one waits for `startView`. */
+  private autoStartView(runtime: Runtime, session: SessionState): void {
+    if (!session.tracked) return;
+    if (this.config.trackViewsManually && !runtime.views.initial) return;
+    this.beginView(session, runtime.views.initial ? 'session_renewal' : 'initial_load');
+  }
+
+  private endCurrentView(runtime: Runtime): void {
+    runtime.stopLoading?.();
+    runtime.stopLoading = undefined;
+    const view = runtime.views.current;
+    if (view) runtime.views.end(view);
+  }
+
+  private beginView(
+    session: SessionState,
+    loadingType: RumViewLoadingType,
+    options: StartViewOptions = {},
+  ): ViewState | undefined {
+    const runtime = this.runtime;
+    if (!runtime || !session.tracked) return undefined;
+    runtime.stopLoading?.();
+
+    const initial = loadingType === 'initial_load';
+    const now = perfNow();
+    const hint = runtime.startHint;
+    const startRel = initial ? 0 : hint !== undefined && hint > 0 && hint <= now ? hint : now;
+    const url = this.viewUrl();
+    const previous = runtime.views.current;
+    const clickRel = runtime.clicks?.lastClickRel();
+    const view = runtime.views.start({
+      sessionId: session.id,
+      sessionStart: session.created,
+      startRel,
+      startDate: initial ? timeOriginEpoch() : relativeToEpoch(startRel),
+      loadingType,
+      url,
+      name: clampText(options.name?.trim() || viewPath(url), 1_024),
+      referrer: initial ? this.documentReferrer() : previous?.url,
+      service: options.service ? clampText(options.service, 256) : undefined,
+      version: options.version ? clampText(options.version, 256) : undefined,
+      context: options.context ? sanitizeContext(options.context) : undefined,
+      interactionToNextViewTime:
+        loadingType === 'route_change' &&
+        clickRel !== undefined &&
+        startRel >= clickRel &&
+        startRel - clickRel <= INTERACTION_TO_VIEW_WINDOW_MS
+          ? toNanoseconds(startRel - clickRel)
+          : undefined,
+      hasReplay: runtime.replay.isRecording(),
     });
-    if (this.enqueue('session', event)) {
-      this.sessionManager?.markReported(session.id);
-    }
-  }
 
-  private reportCurrentSession(): void {
-    const session = this.sessionManager?.current();
-    if (session && this.sessionManager?.needsReport(session)) {
-      this.reportSession(session);
-    }
-  }
-
-  private commonFields(timestamp: number, session: RumSession): RumContext {
-    return compact({
-      timestamp,
-      session_id: session.id,
-      application: this.config.applicationId,
-      environment: this.config.env,
-      version: this.config.version,
-      service: this.config.service,
-      user_id: this.currentUserId(),
-      anonymous_id: this.anonymousUserId,
-      browser: this.browserEnvironment.browser,
-      os: this.browserEnvironment.os,
-      device: this.browserEnvironment.device,
-      language: this.browserEnvironment.language,
-      timezone: this.browserEnvironment.timezone,
-      viewport: this.browserEnvironment.viewport,
-      sdk_name: SDK_NAME,
-      sdk_version: SDK_VERSION,
+    runtime.stopLoading = trackLoadingTime(runtime.activity, view, {
+      initialLoad: initial,
+      schedule: (target) => runtime.views.schedule(target),
     });
-  }
-
-  private enqueue(
-    kind: Exclude<RumEventKind, 'replay'>,
-    event: RumContext,
-  ): boolean {
-    const prepared = this.applyBeforeSend(kind, event);
-    return prepared ? (this.eventTransport?.enqueue(kind, prepared) ?? false) : false;
-  }
-
-  private recordReplay(session: RumSession, event: RumContext): void {
-    if (!this.isReplayEnabled(session)) return;
-    const prepared = this.applyBeforeSend('replay', event);
-    if (prepared) this.eventTransport?.enqueueReplay(session.id, prepared);
-  }
-
-  private applyBeforeSend(kind: RumEventKind, event: RumContext): RumContext | undefined {
-    if (this.config.beforeSend) {
-      try {
-        if (this.config.beforeSend(event, { kind }) === false) return undefined;
-      } catch (error) {
-        reportInternalError(this.config.onError, error, 'RUM beforeSend failed');
-      }
+    if (initial && runtime.resources && !runtime.documentCollected) {
+      runtime.documentCollected = true;
+      runtime.resources.collectDocument();
     }
-    return sanitizeContext(event);
+    return view;
   }
 
-  private applyReplayBeforeSend(event: RumContext): RumContext | undefined {
-    if (!this.config.beforeSend) return event;
+  /**
+   * The view an event that began at `rel` belongs to; null when events are not
+   * collected right now (no consent, no live session, sampled out).
+   */
+  private resolveView(rel: number | undefined): ViewState | undefined {
+    const runtime = this.runtime;
+    if (!runtime || this.stopped || this.trackingConsent !== 'granted') return undefined;
+    // Looking at the session may renew it and start a new view, so look before choosing.
+    const session = runtime.sessions.get();
+    if (!session?.tracked) return undefined;
+    const found =
+      rel === undefined
+        ? runtime.views.current && !runtime.views.current.ended
+          ? runtime.views.current
+          : undefined
+        : runtime.views.find(rel);
+    return found ?? this.lazyInitialView(session);
+  }
+
+  /** With manual views, events that arrive before the first `startView` get an implicit view. */
+  private lazyInitialView(known?: SessionState): ViewState | undefined {
+    const runtime = this.runtime;
+    if (!runtime || runtime.views.initial || !this.config.trackViewsManually) return undefined;
+    const session = known ?? runtime.sessions.get();
+    return session?.tracked ? this.beginView(session, 'initial_load') : undefined;
+  }
+
+  /**
+   * `eventRel` is when the user's event happened. If it renews the session, the
+   * new view starts then, so the event itself is not left outside every view.
+   */
+  private userActivity(eventRel?: number): void {
+    const runtime = this.live();
+    if (!runtime) return;
+    runtime.startHint = eventRel;
     try {
-      return this.config.beforeSend(event, { kind: 'replay' }) === false
-        ? undefined
-        : event;
-    } catch (error) {
-      reportInternalError(this.config.onError, error, 'RUM beforeSend failed');
-      return event;
+      runtime.sessions.touch();
+    } finally {
+      runtime.startHint = undefined;
     }
   }
 
-  private isReplayEnabled(session: RumSession): boolean {
-    if (!session.sampled) return false;
-    if (this.replayOverride !== undefined) return this.replayOverride;
-    return session.replaySampled;
+  private syncReplay(session: SessionState | undefined): void {
+    const runtime = this.runtime;
+    if (!runtime) return;
+    if (session?.tracked && session.replay > 0 && !this.stopped) {
+      runtime.replaySequence.prune(session.id);
+      runtime.replay.start(session.id);
+    } else {
+      runtime.replay.stop();
+    }
+  }
+
+  private onReplayChange(recording: boolean): void {
+    const runtime = this.runtime;
+    const view = runtime?.views.current;
+    if (!runtime || !view || !recording || view.hasReplay) return;
+    view.hasReplay = true;
+    runtime.views.schedule(view);
+  }
+
+  private recordVital(
+    runtime: Runtime,
+    name: string,
+    startRel: number,
+    startDate: number,
+    durationMs: number,
+    context: RumContext,
+    description?: string,
+  ): void {
+    runtime.pipeline.record({
+      type: 'vital',
+      date: startDate,
+      rel: startRel,
+      body: compact({
+        id: generateUuid(),
+        type: 'duration' as const,
+        name,
+        description: description ? truncate(description, 1_024) : undefined,
+        duration: toNanoseconds(durationMs),
+      }),
+      context,
+    });
+  }
+
+  /**
+   * Reports what the instrumentations still hold back, so the next flush sees it.
+   * Clicks that are still waiting for the page to settle are only cut short when
+   * the page is going away (`ending`); otherwise they finish on their own.
+   */
+  private drain(runtime: Runtime, ending = false): void {
+    if (ending) runtime.clicks?.flush();
+    runtime.longTasks.flush();
+    runtime.resources?.flushPending();
+  }
+
+  /** Something every later event carries changed: report the view again. */
+  private refreshView(): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (runtime && view) runtime.views.schedule(view);
+  }
+
+  private live(): Runtime | undefined {
+    return this.runtime && !this.stopped && this.trackingConsent === 'granted'
+      ? this.runtime
+      : undefined;
+  }
+
+  private viewUrl(): string {
+    return sanitizeViewUrl(
+      window.location.href,
+      this.config.trackUrlQueryString,
+      window.location.href,
+    );
+  }
+
+  private documentReferrer(): string | undefined {
+    return document.referrer
+      ? sanitizeUrl(document.referrer, this.config.trackUrlQueryString)
+      : undefined;
   }
 
   private shouldReadTrace(url: string): boolean {
@@ -635,24 +883,6 @@ export class BrowserRumClient implements RumClient {
     }
   }
 
-  private currentUserId(): string | undefined {
-    return this.user?.id ?? this.anonymousUserId;
-  }
-
-  private canTrack(): boolean {
-    return (
-      this.browser &&
-      !this.stopped &&
-      this.trackingConsent === 'granted' &&
-      !!this.sessionManager &&
-      !!this.eventTransport
-    );
-  }
-
-  private fallbackPage(): string {
-    return isBrowserEnvironment() ? this.sanitizeUrl(window.location.href) : '';
-  }
-
   private sanitizeUrl(url: string): string {
     return sanitizeUrl(
       url,
@@ -660,37 +890,35 @@ export class BrowserRumClient implements RumClient {
       isBrowserEnvironment() ? window.location.href : undefined,
     );
   }
-
-  private markChange(): void {
-    this.changeId += 1;
-  }
-
-  private markSessionDirty(): void {
-    const session = this.sessionManager?.current();
-    if (session) this.sessionManager?.markDirty(session.id);
-  }
-
-  private pruneRecentErrors(now: number): void {
-    if (this.recentErrors.size < 100) return;
-    for (const [signature, timestamp] of this.recentErrors) {
-      if (now - timestamp > 60_000) this.recentErrors.delete(signature);
-    }
-  }
 }
 
-function compact<T extends object>(value: T): T {
-  for (const key of Object.keys(value) as Array<keyof T>) {
-    if (value[key] === undefined) delete value[key];
+function normalizeViewOptions(
+  nameOrOptions: string | StartViewOptions | undefined,
+  context: RumContext | undefined,
+): StartViewOptions {
+  const options: StartViewOptions =
+    typeof nameOrOptions === 'string' ? { name: nameOrOptions } : { ...nameOrOptions };
+  if (context) options.context = { ...options.context, ...context };
+  return options;
+}
+
+function findPendingVital(
+  pending: Map<string, PendingVital>,
+  nameOrReference: string | DurationVitalReference,
+): PendingVital | undefined {
+  if (typeof nameOrReference === 'object' && nameOrReference !== null) {
+    return pending.get(nameOrReference.id);
   }
-  return value;
+  let found: PendingVital | undefined;
+  for (const candidate of pending.values()) {
+    if (candidate.reference.name === nameOrReference) found = candidate;
+  }
+  return found;
 }
 
-function finite(value: number | undefined): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value ? value : undefined;
+/** A `performance.now()` timestamp, from either that or epoch milliseconds. */
+function toRelative(time: number): number {
+  return time > ONE_YEAR_MS ? epochToRelative(time) : time;
 }
 
 function emptyTransportStats(): RumTransportStats {

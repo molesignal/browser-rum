@@ -1,6 +1,6 @@
 import type { RumContext, UrlMatcher } from './types.js';
 
-export const SDK_NAME = '@molesignal/browser-rum';
+export const SDK_NAME = 'molesignal-browser-rum';
 declare const __MOLESIGNAL_RUM_VERSION__: string | undefined;
 export const SDK_VERSION =
   typeof __MOLESIGNAL_RUM_VERSION__ === 'string'
@@ -10,25 +10,58 @@ export const SDK_VERSION =
 const SENSITIVE_KEY =
   /(?:password|passwd|secret|token|authorization|cookie|set-cookie|api[-_]?key|credit[-_]?card|cvv)/i;
 
-export function nowMicros(): number {
-  return Date.now() * 1_000;
+const HTTP_METHODS = new Set([
+  'POST',
+  'GET',
+  'HEAD',
+  'PUT',
+  'DELETE',
+  'PATCH',
+  'TRACE',
+  'OPTIONS',
+  'CONNECT',
+]);
+
+export type HttpMethod =
+  | 'POST'
+  | 'GET'
+  | 'HEAD'
+  | 'PUT'
+  | 'DELETE'
+  | 'PATCH'
+  | 'TRACE'
+  | 'OPTIONS'
+  | 'CONNECT';
+
+/** The contract only knows the standard HTTP methods; anything else is left out. */
+export function normalizeHttpMethod(value: string | undefined): HttpMethod | undefined {
+  const method = value?.toUpperCase();
+  return method && HTTP_METHODS.has(method) ? (method as HttpMethod) : undefined;
 }
 
-export function durationNow(): number {
-  return typeof performance !== 'undefined' && typeof performance.now === 'function'
-    ? performance.now()
-    : Date.now();
-}
-
-export function generateId(prefix: string): string {
+/** A random RFC 4122 version 4 UUID; it always satisfies the contract's identifier pattern. */
+export function generateUuid(): string {
   const cryptoObject = globalThis.crypto;
   if (cryptoObject && typeof cryptoObject.randomUUID === 'function') {
-    return `${prefix}_${cryptoObject.randomUUID().replace(/-/g, '')}`;
+    return cryptoObject.randomUUID();
   }
-  const random = `${Math.random().toString(36).slice(2)}${Math.random()
-    .toString(36)
-    .slice(2)}`;
-  return `${prefix}_${Date.now().toString(36)}${random}`;
+  const bytes = new Uint8Array(16);
+  if (cryptoObject && typeof cryptoObject.getRandomValues === 'function') {
+    cryptoObject.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** A prefixed random identifier for SDK-internal records such as queue rows. */
+export function generateId(prefix: string): string {
+  return `${prefix}_${generateUuid().replace(/-/g, '')}`;
 }
 
 export function sample(rate: number): boolean {
@@ -93,8 +126,14 @@ export function sanitizeValue(
   return result;
 }
 
+/** Shortens `value` and marks the cut with an ellipsis. */
 export function truncate(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}…`;
+}
+
+/** Shortens `value` to at most `limit` characters, for fields with a hard length limit. */
+export function clampText(value: string, limit: number): string {
+  return value.length <= limit ? value : value.slice(0, limit);
 }
 
 export function sanitizeUrl(
@@ -115,13 +154,40 @@ export function sanitizeUrl(
   }
 }
 
-export function pagePath(url: string): string {
+/**
+ * Like `sanitizeUrl`, but keeps a fragment that is a client-side route
+ * (`#/orders`, `#!/orders`) so hash-routed applications still get distinct
+ * views. A query inside the fragment follows `includeQueryString`.
+ */
+export function sanitizeViewUrl(
+  raw: string,
+  includeQueryString: boolean,
+  base?: string,
+): string {
+  const clean = sanitizeUrl(raw, includeQueryString, base);
+  try {
+    const hash = routeHash(new URL(raw, base).hash, includeQueryString);
+    return hash ? `${clean}${hash}` : clean;
+  } catch {
+    return clean;
+  }
+}
+
+/** The default name of a view: its path, plus a route-style fragment. */
+export function viewPath(url: string): string {
   try {
     const parsed = new URL(url);
-    return `${parsed.pathname}${parsed.search}`;
+    return `${parsed.pathname}${routeHash(parsed.hash, false)}`;
   } catch {
     return url;
   }
+}
+
+function routeHash(hash: string, includeQueryString: boolean): string {
+  if (!/^#!?\//.test(hash)) return '';
+  if (includeQueryString) return hash;
+  const query = hash.indexOf('?');
+  return query >= 0 ? hash.slice(0, query) : hash;
 }
 
 export function matchesUrl(url: string, matchers: UrlMatcher[]): boolean {
@@ -181,6 +247,12 @@ export function fnv1a(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
+/**
+ * Marks the errors handed to `onError`, so that an application that logs them
+ * with `console.error` does not see them come back as `console` error events.
+ */
+export const INTERNAL_ERROR_FLAG = Symbol.for('molesignal.rum.internal');
+
 export function reportInternalError(
   handler: ((error: Error) => void) | undefined,
   error: unknown,
@@ -192,6 +264,7 @@ export function reportInternalError(
   try {
     const wrapped = new Error(`${prefix}: ${normalized.message}`);
     (wrapped as Error & { cause?: unknown }).cause = normalized;
+    (wrapped as unknown as Record<symbol, unknown>)[INTERNAL_ERROR_FLAG] = true;
     handler(wrapped);
   } catch {
     // User-provided diagnostics must never break the monitored application.
@@ -206,7 +279,20 @@ export function isBrowserEnvironment(): boolean {
   );
 }
 
-function isPlainObject(value: unknown): value is RumContext {
+/** Drops keys whose value is undefined, in place. */
+export function compact<T extends object>(value: T): T {
+  for (const key of Object.keys(value) as Array<keyof T>) {
+    if (value[key] === undefined) delete value[key];
+  }
+  return value;
+}
+
+export function byteLength(value: string): number {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(value).byteLength;
+  return value.length * 2;
+}
+
+export function isPlainObject(value: unknown): value is RumContext {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 

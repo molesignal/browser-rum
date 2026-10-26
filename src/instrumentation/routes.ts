@@ -1,17 +1,21 @@
-import type { Cleanup, InstrumentationHooks } from './types.js';
+import type { Cleanup } from './types.js';
 
-export function instrumentViews(hooks: InstrumentationHooks): Cleanup {
-  let lastUrl = window.location.href;
+/**
+ * Detects client-side navigation (History API, back/forward, route-style
+ * hashes) and calls `onChange` when the route changed. A change of the query
+ * string alone is not a new view; the path and a `#/route` fragment are.
+ */
+export function instrumentRoutes(onChange: () => void): Cleanup {
+  let lastRoute = routeKey();
   const historyObject = window.history;
   const originalPushState = historyObject.pushState;
   const originalReplaceState = historyObject.replaceState;
 
   const notifyIfChanged = (): void => {
-    const current = window.location.href;
-    if (current === lastUrl) return;
-    lastUrl = current;
-    hooks.markChange();
-    hooks.startView();
+    const current = routeKey();
+    if (current === lastRoute) return;
+    lastRoute = current;
+    onChange();
   };
 
   const wrappedPushState: History['pushState'] = function (
@@ -48,4 +52,10 @@ export function instrumentViews(hooks: InstrumentationHooks): Cleanup {
       historyObject.replaceState = originalReplaceState;
     }
   };
+}
+
+function routeKey(): string {
+  const { pathname, hash } = window.location;
+  const route = /^#!?\//.test(hash) ? (hash.split('?', 1)[0] ?? '') : '';
+  return `${pathname}${route}`;
 }
