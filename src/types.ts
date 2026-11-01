@@ -160,7 +160,7 @@ export interface RumInitConfiguration {
    * `A-Z a-z 0-9 . _ : -`.
    */
   applicationId: string;
-  /** Application-bound `msrum_<16>_<32>` token used as a Bearer token. */
+  /** Application-bound `mspat-<36>` token used as a Bearer token. */
   clientToken: string;
   /** MoleSignal origin, for example https://molesignal.example.com. */
   site: string;

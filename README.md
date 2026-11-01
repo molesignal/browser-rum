@@ -8,8 +8,8 @@ DOM session replay.
 
 [简体中文](README.zh-CN.md)
 
-> **0.3.0 changes what `allow` records, and needs Node 24 to install.** See
-> [Upgrading from 0.2](#upgrading-from-02).
+> **0.4.0 takes only `mspat-` client tokens.** See
+> [Upgrading from 0.3](#upgrading-from-03).
 
 ## Install
 
@@ -28,7 +28,7 @@ import { init } from '@molesignal/browser-rum';
 
 const rum = init({
   applicationId: 'checkout-web',
-  clientToken: 'msrum_your_client_token',
+  clientToken: 'mspat-your-client-token',
   site: 'https://molesignal.example.com',
   service: 'web-frontend',
   env: 'production',
@@ -70,12 +70,12 @@ this snippet; callbacks passed to `onReady` wait until the script has loaded:
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.3.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.4.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
       applicationId: 'checkout-web',
-      clientToken: 'msrum_your_client_token',
+      clientToken: 'mspat-your-client-token',
       site: 'https://molesignal.example.com',
       service: 'web-frontend',
       env: 'production',
@@ -150,7 +150,7 @@ init({ /* … */ trackSessionAcrossSubdomains: true }); // or sessionCookieDomai
 ```ts
 const rum = init({
   applicationId: 'checkout-web',
-  clientToken: 'msrum_your_client_token',
+  clientToken: 'mspat-your-client-token',
   site: 'https://molesignal.example.com',
   user: { id: currentUser.id, plan: currentUser.plan },
   globalContext: { region: 'eu-west-1' },
@@ -393,7 +393,7 @@ allowedTracingUrls: [
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `applicationId` | required | Application identifier of the client token; sent as `application.id` |
-| `clientToken` | required | Application-bound `msrum_` RUM client token |
+| `clientToken` | required | Application-bound RUM client token (`mspat-<36>`) |
 | `site` | required | MoleSignal origin, or an `/api`, `/api/v1`, `/api/v1/rum` base |
 | `service` | `applicationId` | `service` of the events |
 | `env`, `version` | unset | Deployment dimensions; `version` is required for Source Map lookup |
@@ -502,7 +502,8 @@ counts, with the drop reasons.
   follow the URL rules above.
 - `clientToken` ships to the browser and must be treated as public. Never reuse
   an owner/admin, personal or default intake token; use the application-bound
-  `msrum_` token created by the data-source guide.
+  token created by the data-source guide. Every MoleSignal token starts with
+  `mspat-`, so the SDK cannot tell them apart.
 
 ## Browser support
 
@@ -511,6 +512,12 @@ TypeScript declarations. Optional browser APIs (`PerformanceObserver`, long
 animation frames, `MutationObserver`, IndexedDB, cookies) degrade independently
 when unavailable. The end-to-end suite runs against Chromium, Firefox and
 WebKit.
+
+## Upgrading from 0.3
+
+- **Client tokens.** `clientToken` takes the `mspat-<36>` format. A token of the old
+  `msrum_<16>_<32>` format is refused when the SDK starts.
+- **Server.** The new format needs a MoleSignal server that issues it. Create a new client token there.
 
 ## Upgrading from 0.2
 

@@ -320,9 +320,9 @@ function normalizeApplicationId(value: unknown): string {
 
 function normalizeClientToken(value: unknown): string {
   const token = requiredString(value, 'clientToken');
-  if (!/^msrum_[0-9A-Za-z]{16}_[0-9A-Za-z]{32}$/.test(token)) {
+  if (!/^mspat-[0-9a-z]{36}$/.test(token)) {
     throw new TypeError(
-      'MoleSignal RUM "clientToken" must be an application-bound msrum_<16>_<32> token',
+      'MoleSignal RUM "clientToken" must be an application-bound mspat-<36> token',
     );
   }
   return token;

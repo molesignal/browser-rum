@@ -6,7 +6,7 @@ MoleSignal 官方浏览器端 Real User Monitoring SDK。它把页面视图、�
 
 [English](README.md)
 
-> **0.3.0 改变了 `allow` 录制的内容，安装需要 Node 24。** 详见[从 0.2 升级](#从-02-升级)。
+> **0.4.0 只接受 `mspat-` 开头的 Client Token。** 详见[从 0.3 升级](#从-03-升级)。
 
 ## 安装
 
@@ -25,7 +25,7 @@ import { init } from '@molesignal/browser-rum';
 
 const rum = init({
   applicationId: 'checkout-web',
-  clientToken: 'msrum_your_client_token',
+  clientToken: 'mspat-your-client-token',
   site: 'https://molesignal.example.com',
   service: 'web-frontend',
   env: 'production',
@@ -64,12 +64,12 @@ SDK 写入两个端点，均携带 `Authorization: Bearer <clientToken>`：
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.3.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.4.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
       applicationId: 'checkout-web',
-      clientToken: 'msrum_your_client_token',
+      clientToken: 'mspat-your-client-token',
       site: 'https://molesignal.example.com',
       service: 'web-frontend',
       env: 'production',
@@ -132,7 +132,7 @@ init({ /* … */ trackSessionAcrossSubdomains: true }); // 或 sessionCookieDoma
 ```ts
 const rum = init({
   applicationId: 'checkout-web',
-  clientToken: 'msrum_your_client_token',
+  clientToken: 'mspat-your-client-token',
   site: 'https://molesignal.example.com',
   user: { id: currentUser.id, plan: currentUser.plan },
   globalContext: { region: 'cn-east-1' },
@@ -353,7 +353,7 @@ allowedTracingUrls: [
 | 选项 | 默认值 | 作用 |
 | --- | --- | --- |
 | `applicationId` | 必填 | 令牌所属应用的标识；作为 `application.id` 上报 |
-| `clientToken` | 必填 | 与应用绑定的 `msrum_` Client Token |
+| `clientToken` | 必填 | 与应用绑定的 Client Token（`mspat-<36>`） |
 | `site` | 必填 | MoleSignal 源站地址，或 `/api`、`/api/v1`、`/api/v1/rum` 前缀 |
 | `service` | `applicationId` | 事件的 `service` |
 | `env`、`version` | 未设置 | 部署维度；Source Map 查找需要 `version` |
@@ -448,13 +448,19 @@ init({
   `aria-label`、`title` 或文本给操作命名，并记录更丰富的选择器。
 - 栈既以文本也以结构化帧上报；其中的文件名遵循上面的 URL 规则。
 - `clientToken` 会随前端代码下发，必须视为公开凭证。不要复用 Owner/Admin、个人 Token 或
-  默认接入 Token，请使用数据源接入向导生成的应用绑定 `msrum_` Client Token。
+  默认接入 Token，请使用数据源接入向导生成的应用绑定 Client Token。所有 MoleSignal Token 都以
+  `mspat-` 开头，SDK 无法区分。
 
 ## 浏览器支持
 
 构建产物面向 ES2020，提供 ESM、CommonJS、IIFE 单文件包和 TypeScript 声明。
 `PerformanceObserver`、长动画帧、`MutationObserver`、IndexedDB、cookie 等可选浏览器能力在
 不可用时各自独立降级。端到端测试覆盖 Chromium、Firefox 与 WebKit。
+
+## 从 0.3 升级
+
+- **Client Token。** `clientToken` 改为 `mspat-<36>` 格式。旧格式 `msrum_<16>_<32>` 的 Token 在 SDK 启动时就会被拒绝。
+- **服务端。** 新格式需要能签发它的 MoleSignal 服务端，请在那里新建 Client Token。
 
 ## 从 0.2 升级
 

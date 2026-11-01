@@ -64,8 +64,8 @@ test('configuration validation and SSR imports are safe', async () => {
     /http or https/,
   );
   assert.throws(
-    () => initRum({ applicationId: 'app', clientToken: 'ms_personal', site }),
-    /application-bound msrum_/,
+    () => initRum({ applicationId: 'app', clientToken: 'mspat-short', site }),
+    /application-bound mspat-/,
   );
   assert.throws(
     () =>
@@ -171,7 +171,7 @@ test('events carry the common attributes of the MoleSignal event contract', asyn
     assert.deepEqual(action.usr, { id: 'user-42', plan: 'pro' });
     assert.deepEqual(action.account, { id: 'acme' });
     assert.equal(action.sdk.name, 'molesignal-browser-rum');
-    assert.equal(action.sdk.version, '0.3.0');
+    assert.equal(action.sdk.version, '0.4.0');
     assert.equal(action.sdk.session_sample_rate, 100);
     assert.equal(action.sdk.replay_sample_rate, 20);
     assert.equal(action.display.viewport.width, 1440);

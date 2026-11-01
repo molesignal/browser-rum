@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 
 import { contractViolations, sessionStartViolations } from './contract.mjs';
 
-export const CLIENT_TOKEN = 'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF';
+export const CLIENT_TOKEN = 'mspat-0123456789abcdefghjkmnpqrstvwxyz0123';
 
 /** A cookie jar that understands `expires`, which is all the SDK's session cookie needs. */
 function createCookieJar() {

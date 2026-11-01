@@ -13,7 +13,7 @@ import {
 } from '@molesignal/browser-rum';
 
 const clientToken =
-  'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF';
+  'mspat-0123456789abcdefghjkmnpqrstvwxyz0123';
 
 const configuration: RumInitConfiguration = {
   applicationId: 'type-test',

@@ -88,7 +88,7 @@ test('the browser bundle defines MoleSignalRum and runs the callbacks queued by 
   // It is safe to use outside a browser, like the package itself.
   const client = sandbox.MoleSignalRum.init({
     applicationId: 'cdn-app',
-    clientToken: 'msrum_0123456789ABCDEF_0123456789ABCDEF0123456789ABCDEF',
+    clientToken: 'mspat-0123456789abcdefghjkmnpqrstvwxyz0123',
     site: 'https://rum.example.test',
   });
   client.addAction('server');
