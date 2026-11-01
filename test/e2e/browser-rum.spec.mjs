@@ -697,7 +697,7 @@ test('browser events have the shape of the browser fixtures', async ({ page, bro
   // `artifact_kind` (the server takes a frame with a file and a line as a source map frame)
   // and `error.fingerprint` (the developer's choice: the SDK sets it only when addError gets one).
   const ignored = (path) =>
-    /^(usr\.(name|email|plan)|account\.|context\.|feature_flags\.|device\.type|session\.has_replay)/.test(path) ||
+    /^(usr\.(name|email|plan)|account\.|context\.|feature_flags\.|device\.type|session\.has_replay|synthetics\.|ci_test\.)/.test(path) ||
     /^error\.(frames\[\]\.artifact_kind|fingerprint)$/.test(path) ||
     /^view\.(performance\.|custom_timings\.|crash)/.test(path) ||
     /^resource\.(dns|connect|ssl|response|request|graphql)/.test(path) ||
@@ -770,4 +770,138 @@ test('browser events have the shape of the browser fixtures', async ({ page, bro
   for (const expected of ['view', 'click', 'error', 'network error', 'resource', 'vital']) {
     expect(compared.has(expected), `${expected} was compared with its fixture`).toBe(true);
   }
+});
+
+test('a log goes with its session and view, and the console only when asked', async ({ page }) => {
+  const rum = await start(page, { forwardConsoleLogs: ['warn'] });
+
+  await page.evaluate(async () => {
+    window.rum.logger.info('cart opened', { items: 3 });
+    window.rum.logger.debug('below the level of a logger that takes everything');
+    console.warn('forwarded to the logs');
+    console.info('not forwarded');
+    await window.rum.flush();
+  });
+
+  await expect.poll(() => rum.events('log').length).toBeGreaterThanOrEqual(2);
+
+  const logs = rum.events('log');
+  const messages = logs.map((event) => event.message);
+
+  expect(messages).toContain('cart opened');
+  expect(messages).toContain('forwarded to the logs');
+  expect(messages).not.toContain('not forwarded');
+
+  const view = rum.events('view')[0];
+
+  for (const log of logs) {
+    expect(log.session.id).toBe(view.session.id);
+    expect(log.view.id).toBe(view.view.id);
+  }
+});
+
+test('a click says where its element stands and where in it it landed, and a view how far down it went', async ({
+  page,
+}) => {
+  const rum = await start(page, { trackUserInteractions: true });
+
+  await page.evaluate(() => {
+    const tall = document.createElement('div');
+
+    tall.style.height = '4000px';
+    document.body.append(tall);
+  });
+
+  await page.locator('#dead-button').click({ position: { x: 5, y: 5 } });
+  await page.evaluate(() => window.scrollTo(0, 1500));
+  await page.waitForTimeout(200);
+  await page.evaluate(() => window.rum.flush());
+
+  await expect.poll(() => rum.events('action').some((event) => event.action.type === 'click')).toBe(true);
+
+  const { target, page_position: place } = rum.events('action').find((event) => event.action.type === 'click').action;
+
+  expect(target.path).toMatch(/^body>main.*button/);
+  expect(target.path).not.toContain('Does nothing');
+  expect(target.offset.x).toBeGreaterThanOrEqual(4);
+  expect(target.offset.y).toBeGreaterThanOrEqual(4);
+  expect(place.x).toBeGreaterThan(0);
+
+  await expect
+    .poll(async () => {
+      await flush(page);
+
+      return rum.views().at(-1)?.view.scroll?.max_depth ?? 0;
+    })
+    .toBeGreaterThan(1500);
+
+  expect(rum.views().at(-1).view.scroll.max_scroll_height).toBeGreaterThan(4000);
+});
+
+test('a test that drives the page marks the session, keeps it whatever is sampled, and is told its id', async ({
+  page,
+}) => {
+  const rum = await start(page, null);
+
+  await page.evaluate(() => {
+    window.__MOLESIGNAL_TEST_CONTEXT__ = { type: 'synthetics', test_id: 'check-1', result_id: 'run-1', location_id: 'eu' };
+  });
+  await boot(page, { sessionSampleRate: 0 });
+  await flush(page);
+
+  await expect.poll(() => rum.events('view').length).toBeGreaterThan(0);
+
+  const view = rum.events('view')[0];
+
+  expect(view.session.type).toBe('synthetics');
+  expect(view.synthetics).toEqual({ test_id: 'check-1', result_id: 'run-1', location_id: 'eu' });
+  expect(await page.evaluate(() => window.__MOLESIGNAL_RUM_SESSION__)).toBe(view.session.id);
+  expect(await page.evaluate(() => window.rum.getSessionReplayLink())).toBe(
+    `http://127.0.0.1:4173/rum/sessions/view/${view.session.id}`,
+  );
+});
+
+test('a part of a masked page marked as allowed shows its text, but not what is masked in it', async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    const part = document.createElement('section');
+
+    part.setAttribute('data-molesignal-allow', '');
+    part.innerHTML = '<p>Plainly public words</p><p data-molesignal-mask>Quietly private words</p><div contenteditable="true">Freshly typed words</div>';
+    document.body.append(part);
+
+    const outside = document.createElement('p');
+
+    outside.textContent = 'Everything else stays hidden';
+    document.body.append(outside);
+  });
+
+  const rum = await start(page, { sessionReplaySampleRate: 100, sessionSampleRate: 100, defaultPrivacyLevel: 'mask' });
+
+  await expect
+    .poll(() => rum.replay().flatMap((segment) => segment.events).some((event) => event.type === 2))
+    .toBe(true);
+
+  const recorded = JSON.stringify(rum.replay().flatMap((segment) => segment.events));
+
+  expect(recorded).toContain('Plainly public words');
+  expect(recorded).not.toContain('Quietly private words');
+  expect(recorded).not.toContain('Freshly typed words');
+  expect(recorded).not.toContain('Everything else stays hidden');
+});
+
+test('mask-user-input shows the page and hides what is typed', async ({
+  page,
+}) => {
+  const rum = await start(page, { sessionReplaySampleRate: 100, sessionSampleRate: 100, defaultPrivacyLevel: 'mask-user-input' });
+
+  await expect
+    .poll(() => rum.replay().flatMap((segment) => segment.events).some((event) => event.type === 2))
+    .toBe(true);
+
+  const recorded = JSON.stringify(rum.replay().flatMap((segment) => segment.events));
+
+  expect(recorded).toContain('Does nothing');
+  expect(recorded).not.toContain('super-secret-input-value');
 });

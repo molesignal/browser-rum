@@ -5,7 +5,7 @@ import {
   timeOriginEpoch,
   toNanoseconds,
 } from './clock.js';
-import type { NormalizedRumConfiguration } from './config.js';
+import { sessionPage, type NormalizedRumConfiguration } from './config.js';
 import { ContextStore } from './context.js';
 import {
   clearAnonymousUserId,
@@ -17,6 +17,13 @@ import {
 import type { RumViewLoadingType } from './events.js';
 import { ErrorRecorder, captureHandlingStack, instrumentErrors } from './instrumentation/errors.js';
 import { instrumentClicks, type ClickTracker } from './instrumentation/clicks.js';
+import {
+  createLogger,
+  createSdkReporter,
+  instrumentConsole,
+  type LogInput,
+  recordLog,
+} from './instrumentation/logs.js';
 import { instrumentLongTasks, type LongTaskTracker } from './instrumentation/long-tasks.js';
 import { instrumentNetwork } from './instrumentation/network.js';
 import { createResourceCollector, type ResourceCollector } from './instrumentation/resources.js';
@@ -28,6 +35,7 @@ import { ReplayRecorder } from './replay/recorder.js';
 import { ReplaySequence } from './replay/sequence.js';
 import { SessionManager, type SessionChange } from './session/manager.js';
 import { createSessionStore, type SessionState } from './session/store.js';
+import { publishTestSession } from './test-context.js';
 import { EventTransport } from './transport.js';
 import type {
   AddDurationVitalOptions,
@@ -38,6 +46,8 @@ import type {
   RumClient,
   RumContext,
   RumInternalContext,
+  RumLogger,
+  RumLoggerOptions,
   RumTransportStats,
   RumUser,
   StartViewOptions,
@@ -61,6 +71,7 @@ import {
 import { ActionHistory } from './view/history.js';
 import { trackLoadingTime } from './view/loading.js';
 import { PageActivityMonitor } from './view/page-activity.js';
+import { instrumentScroll } from './view/scroll.js';
 import { ViewState, ViewTracker } from './view/tracker.js';
 
 /** A route change this soon after a click is attributed to the click. */
@@ -96,6 +107,7 @@ interface Runtime {
   longTasks: LongTaskTracker;
   clicks?: ClickTracker;
   stopLoading?: () => void;
+  measureScroll?: () => void;
   vitals: Map<string, PendingVital>;
   documentCollected: boolean;
   /** Set while an explicit `startView` creates the view the session change would. */
@@ -112,8 +124,18 @@ export class BrowserRumClient implements RumClient {
   private consentTransition: Promise<void> = Promise.resolve();
   private stopped = false;
   private stopPromise?: Promise<void>;
+  readonly logger: RumLogger;
 
   constructor(private readonly config: NormalizedRumConfiguration) {
+    this.logger = createLogger((input) => this.writeLog(input));
+    if (config.trackSdkErrors) {
+      const report = createSdkReporter(() => this.live()?.hooks);
+      const given = config.onError;
+      config.onError = (error) => {
+        given?.(error);
+        report(error);
+      };
+    }
     this.contexts = new ContextStore({
       user: config.user,
       account: config.account,
@@ -248,6 +270,16 @@ export class BrowserRumClient implements RumClient {
     runtime.views.schedule(view);
   }
 
+  createLogger(options?: RumLoggerOptions): RumLogger {
+    return createLogger((input) => this.writeLog(input), options);
+  }
+
+  /** Writes one log; the loggers of the API come here. */
+  writeLog(input: LogInput): void {
+    const runtime = this.live();
+    if (runtime) recordLog(runtime.hooks, input);
+  }
+
   startView(nameOrOptions?: string | StartViewOptions, context?: RumContext): void {
     const runtime = this.live();
     if (!runtime) return;
@@ -295,6 +327,16 @@ export class BrowserRumClient implements RumClient {
 
   getViewContext(): RumContext {
     return { ...(this.runtime?.views.current?.context ?? {}) };
+  }
+
+  setViewLoadingTime(): void {
+    const runtime = this.live();
+    const view = runtime?.views.current;
+    if (!runtime || !view) return;
+    runtime.stopLoading?.();
+    runtime.stopLoading = undefined;
+    view.loadingTime = toNanoseconds(perfNow() - view.startRel);
+    runtime.views.schedule(view);
   }
 
   startDurationVital(
@@ -381,6 +423,11 @@ export class BrowserRumClient implements RumClient {
 
   stopSession(): void {
     this.live()?.sessions.end();
+  }
+
+  getSessionReplayLink(): string | undefined {
+    const session = this.live()?.sessions.get();
+    return session?.tracked ? sessionPage(this.config, session.id) : undefined;
   }
 
   setTrackingConsent(consent: TrackingConsent): void {
@@ -582,6 +629,18 @@ export class BrowserRumClient implements RumClient {
       cleanups.push(() => clicks.stop());
     }
     if (!config.trackViewsManually) cleanups.push(instrumentRoutes(() => this.startView()));
+    if (config.forwardConsoleLogs.length > 0) {
+      cleanups.push(instrumentConsole(hooks, config.forwardConsoleLogs));
+    }
+    if (config.trackScroll) {
+      const scroll = instrumentScroll(
+        () => runtime.views.current,
+        (view) => runtime.views.schedule(view),
+      );
+      runtime.measureScroll = scroll.measureNow;
+      cleanups.push(scroll.stop);
+      scroll.measureNow();
+    }
 
     this.installLifecycle(runtime);
     this.installUserActivity(runtime);
@@ -676,14 +735,21 @@ export class BrowserRumClient implements RumClient {
         this.syncReplay(undefined);
         break;
       case 'switched':
+        this.announceTestSession(change.session);
         this.syncReplay(change.session);
         if (!runtime.autoViewSuppressed) this.beginView(change.session, 'session_renewal');
         break;
       case 'started':
+        this.announceTestSession(change.session);
         this.syncReplay(change.session);
         if (!runtime.autoViewSuppressed) this.autoStartView(runtime, change.session);
         break;
     }
+  }
+
+  /** A test that drives the page links to the session it became. */
+  private announceTestSession(session: SessionState): void {
+    if (this.config.testContext && session.tracked) publishTestSession(session.id);
   }
 
   /** The first view of a new session; with manual views the initial one waits for `startView`. */
@@ -746,6 +812,7 @@ export class BrowserRumClient implements RumClient {
       runtime.documentCollected = true;
       runtime.resources.collectDocument();
     }
+    runtime.measureScroll?.();
     return view;
   }
 

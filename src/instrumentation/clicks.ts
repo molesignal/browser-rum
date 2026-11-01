@@ -1,6 +1,6 @@
 import { perfNow, relativeToEpoch, toNanoseconds, unrefTimer } from '../clock.js';
 import type { RumActionBody } from '../events.js';
-import { actionTargetName, elementSelector } from '../selector.js';
+import { actionTargetName, elementPath, elementSelector } from '../selector.js';
 import { compact, generateUuid, reportInternalError } from '../utils.js';
 import { type PageActivityEnd, waitPageActivityEnd } from '../view/page-activity.js';
 import type { LongTaskTracker } from './long-tasks.js';
@@ -61,7 +61,10 @@ export function instrumentClicks(
 
   const onClick = (event: MouseEvent): void => {
     if (event.button !== 0 || !(event.target instanceof Element)) return;
-    const element = closestInteractiveElement(event.target, actionNameAttribute);
+    // A click on what is not a control still says where people expect one.
+    const element =
+      closestInteractiveElement(event.target, actionNameAttribute) ??
+      (event.target instanceof HTMLElement ? event.target : undefined);
     if (!element) return;
 
     // Whatever the page does from now on is the reaction to this click, not to the earlier ones.
@@ -78,6 +81,15 @@ export function instrumentClicks(
       actionNameAttribute,
     );
     const rect = element.getBoundingClientRect();
+    const path = elementPath(element);
+    const offset = {
+      x: Math.max(0, Math.round(event.clientX - rect.left)),
+      y: Math.max(0, Math.round(event.clientY - rect.top)),
+    };
+    const pagePosition = {
+      x: Math.round(event.clientX + (window.scrollX || 0)),
+      y: Math.round(event.clientY + (window.scrollY || 0)),
+    };
     const selectionAtClick = currentSelection();
     const frustrations = new Set<Frustration>();
     const detect = trackFrustrations && event.isTrusted;
@@ -102,10 +114,13 @@ export function instrumentClicks(
           target: compact({
             name,
             selector,
+            path,
             width: Math.round(rect.width),
             height: Math.round(rect.height),
+            offset,
           }),
           position: { x: Math.round(event.clientX), y: Math.round(event.clientY) },
+          page_position: pagePosition,
           name_source: source,
           frustration: frustrations.size > 0 ? { type: [...frustrations] } : undefined,
           error: { count: record.counts.error },

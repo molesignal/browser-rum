@@ -56,10 +56,11 @@ export class EventPipeline {
     if (!view || !this.withinRateLimit()) return false;
 
     const action =
-      input.type === 'action' || input.type === 'vital'
+      input.type === 'action' || input.type === 'vital' || input.type === 'log'
         ? undefined
         : this.deps.actions.find(input.rel ?? perfNow());
     const event = this.assemble(view, input.type, input.date, input.body, input.context, action);
+    if (input.attributes) Object.assign(event, input.attributes);
     if (!this.applyBeforeSend(event)) return false;
     if (!this.deps.transport()?.enqueue(event as unknown as RumEvent)) return false;
 
@@ -100,6 +101,7 @@ export class EventPipeline {
     action?: ActionRecord,
   ): Record<string, unknown> & { type: RumEventType } {
     const { config, contexts } = this.deps;
+    const test = config.testContext;
     const event: Record<string, unknown> & { type: RumEventType } = {
       type,
       date,
@@ -110,7 +112,7 @@ export class EventPipeline {
       source: 'browser',
       session: compact({
         id: view.sessionId,
-        type: 'user',
+        type: test?.type ?? 'user',
         start: view.sessionStart,
         has_replay: type === 'view' && view.hasReplay ? true : undefined,
       }),
@@ -121,6 +123,16 @@ export class EventPipeline {
     } else {
       if (action) event.action = { id: action.id };
       if (type !== 'view') event[type] = body;
+    }
+
+    if (test?.type === 'synthetics') {
+      event.synthetics = compact({
+        test_id: test.test_id,
+        result_id: test.result_id,
+        location_id: test.location_id,
+      });
+    } else if (test?.type === 'ci_test') {
+      event.ci_test = compact({ test_execution_id: test.test_execution_id });
     }
 
     event.usr = contexts.eventUser();

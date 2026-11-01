@@ -6,6 +6,7 @@ import type {
   RumViewPerformance,
 } from '../events.js';
 import { compact, generateUuid } from '../utils.js';
+import type { ScrollState } from './scroll.js';
 
 /** A view is re-reported at most this often while things keep changing. */
 export const VIEW_UPDATE_THROTTLE = 3_000;
@@ -69,6 +70,7 @@ export class ViewState {
   loadingTime?: number;
   networkSettledTime?: number;
   interactionToNextViewTime?: number;
+  scroll?: ScrollState;
   readonly counts: ViewCounts = {
     action: 0,
     error: 0,
@@ -119,6 +121,14 @@ export function buildViewBody(view: ViewState, now = perfNow()): RumViewBody {
     ...view.navigation,
     network_settled_time: view.networkSettledTime,
     interaction_to_next_view_time: view.interactionToNextViewTime,
+    scroll: view.scroll
+      ? compact({
+          max_depth: view.scroll.maxDepth,
+          max_depth_scroll_top: view.scroll.maxDepthScrollTop,
+          max_scroll_height: view.scroll.maxScrollHeight,
+          max_scroll_height_time: view.scroll.maxScrollHeightTime,
+        })
+      : undefined,
     performance: hasKeys(view.performance) ? view.performance : undefined,
     custom_timings: hasKeys(view.customTimings) ? view.customTimings : undefined,
     action: { count: view.counts.action },

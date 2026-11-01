@@ -1,4 +1,6 @@
 import { normalizeAccount, normalizeUser } from './identity.js';
+import { FORWARDED_CONSOLE_LEVELS, type ForwardedConsoleLevel } from './instrumentation/logs.js';
+import { readTestContext, type TestContext } from './test-context.js';
 import type {
   PrivacyLevel,
   RumAccount,
@@ -35,6 +37,7 @@ export interface NormalizedRumConfiguration {
 
   sessionSampleRate: number;
   sessionReplaySampleRate: number;
+  traceSampleRate: number;
   sessionReplay: Required<RumSessionReplayConfiguration>;
   trackUserInteractions: boolean;
   trackFrustrations: boolean;
@@ -45,6 +48,10 @@ export interface NormalizedRumConfiguration {
   trackViewsManually: boolean;
   trackBfcacheViews: boolean;
   trackAnonymousUser: boolean;
+  trackScroll: boolean;
+  trackSdkErrors: boolean;
+  forwardConsoleLogs: ForwardedConsoleLevel[];
+  trackResourceHeaders: Array<string | RegExp>;
   trackUrlQueryString: boolean;
   defaultPrivacyLevel: PrivacyLevel;
   actionNameAttribute: string;
@@ -57,6 +64,11 @@ export interface NormalizedRumConfiguration {
   replayBatchSize: number;
   maxQueueSize: number;
   enablePersistentQueue: boolean;
+  compressIntakeRequests: boolean;
+  remoteConfiguration: boolean;
+  appUrl?: string;
+  /** What drives the page, when it is not a person. */
+  testContext?: TestContext;
   retryBaseDelay: number;
   retryMaxDelay: number;
   sessionInactivityTimeout: number;
@@ -86,6 +98,7 @@ export function normalizeConfiguration(
     throw new TypeError('MoleSignal RUM "version" is required when "debugId" is set');
   }
   const retryBaseDelay = clampInteger(config.retryBaseDelay, 1_000, 250, 60_000);
+  const testContext = readTestContext();
 
   return {
     applicationId,
@@ -100,8 +113,11 @@ export function normalizeConfiguration(
     globalContext: sanitizeContext(config.globalContext ?? {}),
     trackingConsent: normalizeTrackingConsent(config.trackingConsent),
 
-    sessionSampleRate: normalizeRate(config.sessionSampleRate, 100),
+    // A run of a test has to be found from what ran it: it is not sampled away.
+    sessionSampleRate: testContext ? 100 : normalizeRate(config.sessionSampleRate, 100),
+    testContext,
     sessionReplaySampleRate: normalizeRate(config.sessionReplaySampleRate, 0),
+    traceSampleRate: normalizeRate(config.traceSampleRate, 100),
     sessionReplay: normalizeSessionReplay(config.sessionReplay),
     trackUserInteractions,
     trackFrustrations: config.trackFrustrations ?? trackUserInteractions,
@@ -113,7 +129,11 @@ export function normalizeConfiguration(
     trackBfcacheViews: config.trackBfcacheViews ?? false,
     trackAnonymousUser: config.trackAnonymousUser ?? true,
     trackUrlQueryString: config.trackUrlQueryString ?? false,
-    defaultPrivacyLevel: config.defaultPrivacyLevel ?? 'mask',
+    trackScroll: config.trackScroll ?? true,
+    trackSdkErrors: config.trackSdkErrors ?? true,
+    forwardConsoleLogs: normalizeConsoleLevels(config.forwardConsoleLogs),
+    trackResourceHeaders: [...(config.trackResourceHeaders ?? [])],
+    defaultPrivacyLevel: normalizePrivacyLevel(config.defaultPrivacyLevel),
     actionNameAttribute: normalizeAttributeName(config.actionNameAttribute),
     excludedUrls: [...(config.excludedUrls ?? [])],
     allowedTracingUrls: [...(config.allowedTracingUrls ?? [])],
@@ -134,6 +154,9 @@ export function normalizeConfiguration(
     replayBatchSize: clampInteger(config.replayBatchSize, 100, 1, 200),
     maxQueueSize: clampInteger(config.maxQueueSize, 1_000, 20, 10_000),
     enablePersistentQueue: config.enablePersistentQueue ?? true,
+    compressIntakeRequests: config.compressIntakeRequests ?? false,
+    remoteConfiguration: config.remoteConfiguration ?? false,
+    appUrl: normalizeAppUrl(config.appUrl),
     retryBaseDelay,
     retryMaxDelay: clampInteger(
       config.retryMaxDelay,
@@ -207,7 +230,7 @@ function normalizeSelector(value: string | undefined, fallback: string, field: s
  * origin or end in `/api`, `/api/v1` or `/api/v1/rum`. Events go to
  * `…/api/v1/rum/events`, DOM recordings to `…/api/v1/rum/replay`.
  */
-export function rumEndpoint(site: string, kind: 'events' | 'replay'): string {
+export function rumEndpoint(site: string, kind: 'events' | 'replay' | 'config'): string {
   const url = new URL(site);
   let path = url.pathname.replace(/\/+$/, '');
 
@@ -225,6 +248,41 @@ export function rumEndpoint(site: string, kind: 'events' | 'replay'): string {
   url.search = '';
   url.hash = '';
   return url.toString();
+}
+
+function normalizeConsoleLevels(
+  value: RumInitConfiguration['forwardConsoleLogs'],
+): ForwardedConsoleLevel[] {
+  if (value === 'all') return [...FORWARDED_CONSOLE_LEVELS];
+  if (!Array.isArray(value)) return [];
+  return FORWARDED_CONSOLE_LEVELS.filter((level) => value.includes(level));
+}
+
+function normalizePrivacyLevel(value: PrivacyLevel | undefined): PrivacyLevel {
+  if (value === undefined) return 'mask';
+  if (value !== 'mask' && value !== 'mask-user-input' && value !== 'allow') {
+    throw new TypeError(
+      'MoleSignal RUM "defaultPrivacyLevel" must be "mask", "mask-user-input" or "allow"',
+    );
+  }
+  return value;
+}
+
+function normalizeAppUrl(value: unknown): string | undefined {
+  const url = cleanOptionalString(value);
+  return url === undefined ? undefined : normalizeSite(url);
+}
+
+/**
+ * Where people open MoleSignal: `appUrl`, or the origin of `site` with whatever path it had up to
+ * the API. A session page is under it at `/rum/sessions/view/<id>`.
+ */
+export function sessionPage(
+  config: Pick<NormalizedRumConfiguration, 'site' | 'appUrl'>,
+  sessionId: string,
+): string {
+  const base = (config.appUrl ?? config.site).replace(/\/api(\/v1(\/rum)?)?$/, '');
+  return `${base}/rum/sessions/view/${encodeURIComponent(sessionId)}`;
 }
 
 function normalizeSite(value: string): string {

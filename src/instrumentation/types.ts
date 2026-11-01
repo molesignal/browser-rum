@@ -27,6 +27,8 @@ export interface EventInput {
   view?: ViewState;
   /** Frustration signals of an action; they are counted on the view. */
   frustrationCount?: number;
+  /** What an event says at its top beside its body: the level and the message of a log. */
+  attributes?: Record<string, unknown>;
 }
 
 export type Cleanup = () => void;

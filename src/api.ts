@@ -1,6 +1,8 @@
 import { BrowserRumClient } from './client.js';
 import { normalizeConfiguration } from './config.js';
 import { perfNow } from './clock.js';
+import { createLogger, type LogSink } from './instrumentation/logs.js';
+import { applyRemoteConfiguration, fetchRemoteConfiguration } from './remote.js';
 import type {
   RumClient,
   RumContext,
@@ -49,7 +51,13 @@ export function createRumApi(): RumGlobal {
     if (buffer.length < MAX_BUFFERED_CALLS) buffer.push(call);
   };
 
-  const init = (configuration: RumInitConfiguration): RumClient => {
+  // Logs written before `init` wait with the other calls; a logger stays usable across `init`.
+  const logSink: LogSink = (input) => {
+    if (client) (client as BrowserRumClient).writeLog(input);
+    else queue((c) => (c as BrowserRumClient).writeLog(input));
+  };
+
+  const start = (configuration: RumInitConfiguration): RumClient => {
     const normalized = normalizeConfiguration({
       ...configuration,
       trackingConsent: pendingConsent ?? configuration?.trackingConsent,
@@ -65,7 +73,29 @@ export function createRumApi(): RumGlobal {
         reportInternalError(normalized.onError, error, 'RUM call made before init failed');
       }
     }
+    for (const plugin of configuration.plugins ?? []) {
+      try {
+        plugin.onStart?.({ client: created });
+      } catch (error) {
+        reportInternalError(normalized.onError, error, `RUM plugin ${plugin.name} failed`);
+      }
+    }
     return created;
+  };
+
+  const init = (configuration: RumInitConfiguration): RumClient => {
+    for (const plugin of configuration?.plugins ?? []) plugin.onInit?.(configuration);
+
+    if (!configuration?.remoteConfiguration) return start(configuration);
+
+    // What the server says comes first; calls wait in the buffer until the SDK starts.
+    if (client) void client.stop();
+    client = undefined;
+    const local = normalizeConfiguration(configuration);
+    void fetchRemoteConfiguration(local).then((remote) => {
+      start(applyRemoteConfiguration(configuration, remote));
+    });
+    return api;
   };
 
   const api: RumGlobal = {
@@ -125,6 +155,9 @@ export function createRumApi(): RumGlobal {
         ? client.addFeatureFlagEvaluation(key, value)
         : queue((c) => c.addFeatureFlagEvaluation(key, value)),
 
+    logger: createLogger(logSink),
+    createLogger: (options) => createLogger(logSink, options),
+
     startView: (nameOrOptions, context) =>
       client
         ? client.startView(nameOrOptions, context)
@@ -137,6 +170,8 @@ export function createRumApi(): RumGlobal {
         ? client.setViewContextProperty(key, value)
         : queue((c) => c.setViewContextProperty(key, value)),
     getViewContext: (): RumContext => client?.getViewContext() ?? {},
+    setViewLoadingTime: () =>
+      client ? client.setViewLoadingTime() : queue((c) => c.setViewLoadingTime()),
 
     // Durations depend on when they start and stop, so they are not replayed later.
     startDurationVital: (name, options) => client?.startDurationVital(name, options),
@@ -150,6 +185,7 @@ export function createRumApi(): RumGlobal {
     stopSessionReplayRecording: () =>
       client ? client.stopSessionReplayRecording() : queue((c) => c.stopSessionReplayRecording()),
     stopSession: () => (client ? client.stopSession() : queue((c) => c.stopSession())),
+    getSessionReplayLink: () => client?.getSessionReplayLink(),
 
     setTrackingConsent: (consent) => {
       if (client) {

@@ -327,6 +327,8 @@ function resourceBody(
     type,
     url: hooks.sanitizeUrl(rawUrl),
   };
+  if (record?.requestHeaders) body.request = { headers: record.requestHeaders };
+  if (record?.responseHeaders) body.response = { headers: record.responseHeaders };
 
   const method = normalizeHttpMethod(record?.method);
   if (method) body.method = method;

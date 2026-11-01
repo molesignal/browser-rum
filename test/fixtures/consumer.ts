@@ -109,3 +109,9 @@ declare const event: RumEvent;
 declare const viewEvent: RumViewEvent;
 void event;
 void viewEvent.view.performance?.lcp?.sub_parts?.load_delay;
+
+// The API added after 0.2.
+export const replayLink: string | undefined = rum.getSessionReplayLink();
+rum.setViewLoadingTime();
+rum.logger.warn('a warning', { step: 1 }, new Error('why'));
+rum.createLogger({ name: 'payments', level: 'info' }).info('paid');

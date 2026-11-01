@@ -78,13 +78,15 @@ const IMPORTANCE: Record<RumEventType, number> = {
   error: 1,
   action: 2,
   vital: 3,
-  long_task: 4,
-  resource: 5,
+  log: 4,
+  long_task: 5,
+  resource: 6,
 };
 /** Raw replay events are worth less than the events that explain them. */
 const EVICTION_ORDER: Array<RumEventType | 'replay'> = [
   'resource',
   'long_task',
+  'log',
   'replay',
   'vital',
   'action',
@@ -136,7 +138,7 @@ export class EventTransport {
       events: rumEndpoint(config.site, 'events'),
       replay: rumEndpoint(config.site, 'replay'),
     };
-    this.transport = config.transport ?? new FetchRumTransport();
+    this.transport = config.transport ?? new FetchRumTransport(config.compressIntakeRequests);
     this.storage = new IndexedDbQueueStorage(config);
     this.restorePromise = this.restore();
   }
@@ -495,6 +497,8 @@ export class EventTransport {
           service: this.config.service,
           env: this.config.env,
           version: this.config.version,
+          // A session a test drives is kept whatever the application samples.
+          session_type: this.config.testContext?.type,
         }),
         keepalive,
       );
@@ -545,7 +549,7 @@ export class EventTransport {
       headers: {
         authorization: `Bearer ${this.config.clientToken}`,
         'content-type': 'application/json',
-        'x-molesignal-rum': `browser-rum/${SDK_VERSION}`,
+        'x-molesignal-rum-sdk': `browser-rum/${SDK_VERSION}`,
       },
       keepalive: keepalive && size <= MAX_KEEPALIVE_BODY_BYTES,
       kind,
@@ -742,7 +746,7 @@ export class EventTransport {
 class FetchRumTransport implements RumTransport {
   private readonly fetchImplementation?: typeof fetch;
 
-  constructor() {
+  constructor(private readonly compress = false) {
     if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
       this.fetchImplementation = window.fetch.bind(window);
     } else if (typeof globalThis.fetch === 'function') {
@@ -754,10 +758,17 @@ class FetchRumTransport implements RumTransport {
     if (!this.fetchImplementation) {
       throw new Error('fetch is unavailable; configure a custom RUM transport');
     }
+    // A request that may be the page's last goes as it is: it cannot wait for the compression.
+    const compressed =
+      this.compress && request.kind === 'events' && !request.keepalive
+        ? await gzip(request.body)
+        : undefined;
     const response = await this.fetchImplementation(request.url, {
       method: 'POST',
-      headers: request.headers,
-      body: request.body,
+      headers: compressed
+        ? { ...request.headers, 'content-encoding': 'gzip' }
+        : request.headers,
+      body: compressed ?? request.body,
       keepalive:
         request.keepalive && byteLength(request.body) <= MAX_KEEPALIVE_BODY_BYTES,
       credentials: 'omit',
@@ -777,6 +788,17 @@ class FetchRumTransport implements RumTransport {
       body,
       retryAfterMs: parseRetryAfter(response.headers.get('retry-after')),
     };
+  }
+}
+
+/** The text gzipped, or nothing where the browser cannot do that. */
+async function gzip(text: string): Promise<Blob | undefined> {
+  if (typeof CompressionStream === 'undefined') return undefined;
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    return await new Response(stream).blob();
+  } catch {
+    return undefined;
   }
 }
 

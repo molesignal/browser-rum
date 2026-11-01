@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **Logs.** `logger`, `createLogger` and `forwardConsoleLogs` write `log` events to the stream
+  `rum_logs`, with the session and the view they happen in. What goes wrong in the SDK is said the
+  same way, a few per page load (`trackSdkErrors`).
+- `getSessionReplayLink()` and `appUrl`, `setViewLoadingTime()`.
+- **Heatmaps.** A view reports how far down the page it went (`view.scroll`, `trackScroll`); a click says
+  where the element stands in the page and where in it the click landed (`action.target.path`,
+  `action.target.offset`, `action.page_position`). A click on what is not a control is a click too.
+- **Test traffic.** `window.__MOLESIGNAL_TEST_CONTEXT__` marks a session as `synthetics` or `ci_test`;
+  such a session is not sampled, and its id is set on `window.__MOLESIGNAL_RUM_SESSION__`.
+- `traceSampleRate`, `trackResourceHeaders`, `compressIntakeRequests`, `remoteConfiguration`, `plugins`, and
+  `@molesignal/browser-rum/react` (`reactPlugin`, `trackReactRouter`, `trackTanStackRouter`,
+  `RumErrorBoundary`, `addReactError`).
+- The privacy level `mask-user-input`, and `data-molesignal-allow` for a part of a masked page.
+
+### Changed
+
+- `defaultPrivacyLevel: 'allow'` now shows what is typed into a field, but for passwords, e-mail
+  addresses, telephone numbers and card or one-time-code fields. What `allow` did before is
+  `mask-user-input`.
+- `engines.node` is `>=24`. npm warns on an older Node, and a package manager that enforces `engines`
+  refuses to install. What runs in the browser does not change.
+- Logs, heatmaps and test traffic need a MoleSignal server that knows them.
+
 ## 0.2.0
 
 The SDK now speaks the MoleSignal RUM event contract (`contracts/rum/events`).

@@ -13,12 +13,13 @@ const define = {
 // `dist` is emptied by the build script, so the two builds never clean each other.
 export default defineConfig([
   {
-    entry: ['src/index.ts'],
+    entry: ['src/index.ts', 'src/react.ts'],
     format: ['esm', 'cjs'],
     clean: false,
     splitting: true,
     sourcemap: true,
     treeshake: true,
+    external: ['react'],
     define,
   },
   {

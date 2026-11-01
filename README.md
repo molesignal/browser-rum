@@ -8,9 +8,8 @@ DOM session replay.
 
 [简体中文](README.zh-CN.md)
 
-> **0.2.0 is a breaking release.** The SDK now speaks the MoleSignal
-> RUM event protocol and no longer writes to `/rum/sessions`, `/rum/actions`
-> or `/rum/errors`. See [Upgrading from 0.1](#upgrading-from-01).
+> **0.3.0 changes what `allow` records, and needs Node 24 to install.** See
+> [Upgrading from 0.2](#upgrading-from-02).
 
 ## Install
 
@@ -19,6 +18,8 @@ npm install @molesignal/browser-rum
 ```
 
 or load the single-file browser bundle ([see below](#load-it-from-a-script-tag)).
+
+Installing from npm needs Node 24 or later.
 
 ## Quick start
 
@@ -69,7 +70,7 @@ this snippet; callbacks passed to `onReady` wait until the script has loaded:
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.3.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
@@ -259,6 +260,75 @@ init({
 | Consent | `setTrackingConsent`, `getTrackingConsent` |
 | Delivery | `flush`, `stop`, `getTransportStats` |
 
+## Logs
+
+Logs go to the stream `rum_logs` with the session and the view they were written in, so they show on the
+session page and in the Logs explorer. Nothing is sent until you write a log or ask for the console.
+
+```ts
+import { molesignalRum } from '@molesignal/browser-rum';
+
+molesignalRum.logger.info('cart opened', { items: 3 });
+
+const payments = molesignalRum.createLogger({ name: 'payments', level: 'warn', context: { provider: 'stripe' } });
+payments.error('payment declined', { code: 402 }, error);
+
+// Also forward what the page writes to the console.
+init({ /* … */ forwardConsoleLogs: ['warn', 'error'] });
+```
+
+Logs written before `init` wait for it. A session the application does not keep leaves no logs either.
+
+## React
+
+`@molesignal/browser-rum/react` makes the routes of a router the views of the SDK, named by their patterns
+(`/orders/:id`, not `/orders/42`), and reports what a tree of components throws. React is an optional peer.
+
+```tsx
+import { init } from '@molesignal/browser-rum';
+import { reactPlugin, RumErrorBoundary, trackReactRouter } from '@molesignal/browser-rum/react';
+
+init({ /* … */ plugins: [reactPlugin()] });
+trackReactRouter(router); // a router of createBrowserRouter; trackTanStackRouter for TanStack Router
+
+root.render(
+  <RumErrorBoundary fallback={<Oops />}>
+    <RouterProvider router={router} />
+  </RumErrorBoundary>,
+);
+```
+
+## Feature flags
+
+`addFeatureFlagEvaluation(key, value)` puts a flag on the events of the current view. To follow LaunchDarkly,
+hand it the evaluations of an inspector; to follow OpenFeature, of an `after` hook:
+
+```ts
+LDClient.initialize(id, user, {
+  inspectors: [{
+    type: 'flag-used',
+    name: 'molesignal',
+    method: (key, detail) => molesignalRum.addFeatureFlagEvaluation(key, detail.value),
+  }],
+});
+
+OpenFeature.addHooks({
+  after: (context, details) => molesignalRum.addFeatureFlagEvaluation(context.flagKey, details.value),
+});
+```
+
+## Tests that drive the page
+
+A session is of type `user` unless `window.__MOLESIGNAL_TEST_CONTEXT__` says otherwise before the SDK starts:
+MoleSignal's browser checks set it, and a test run can too (Playwright: `page.addInitScript`).
+
+```ts
+window.__MOLESIGNAL_TEST_CONTEXT__ = { type: 'ci_test', test_execution_id: 'run-1234' };
+```
+
+Such a session is not sampled, and the figures of the application leave it out unless asked for. The SDK sets
+`window.__MOLESIGNAL_RUM_SESSION__` to the id of the session.
+
 ## Session replay
 
 Replay is disabled by default. Enable sampled replay at initialization or start
@@ -282,10 +352,13 @@ rum.stopSessionReplayRecording();
 
 Recording loads rrweb on demand, then captures full DOM snapshots and incremental
 changes: pointer movement, clicks, scrolling, viewport changes and media state.
-Stylesheets are inlined when accessible. All input and contenteditable values
-are always masked; `defaultPrivacyLevel: 'mask'` also masks all page text. Use
-the selectors to block sensitive subtrees, mask selected text when text is
-allowed, or ignore noisy elements. Fonts, inline images and cooperating
+Stylesheets are inlined when accessible. `defaultPrivacyLevel: 'mask'` masks all
+page text and everything typed; `mask-user-input` shows the text of the page and
+masks what is typed and contenteditable areas; `allow` also shows what is typed,
+but for passwords, e-mail addresses, telephone numbers and fields marked for
+cards or one-time codes. Use the selectors to block sensitive subtrees, mask
+selected text when text is allowed, or ignore noisy elements, and mark a part of
+a masked page `data-molesignal-allow` to show its text. Fonts, inline images and cooperating
 cross-origin iframes are opt-in because they can make recordings much larger.
 Views report `session.has_replay: true` while the session records.
 
@@ -345,11 +418,20 @@ allowedTracingUrls: [
 | `trackConsoleErrors` | `false` | Report `console.error` as errors |
 | `trackAnonymousUser` | `true` | Create a persistent anonymous user ID |
 | `trackUrlQueryString` | `false` | Keep query strings in reported URLs |
-| `defaultPrivacyLevel` | `mask` | `mask` or `allow`: whether action names, selectors and element hints carry page text and ids |
+| `trackScroll` | `true` | Keep how far down the page each view goes |
+| `trackResourceHeaders` | `[]` | Headers of a fetch or XHR to keep, by name or RegExp; credentials never are |
+| `forwardConsoleLogs` | `[]` | Console methods that also write logs (`'all'`, or some of `debug`, `log`, `info`, `warn`, `error`) |
+| `trackSdkErrors` | `true` | Say what goes wrong in the SDK as logs of the application, a few per page load |
+| `defaultPrivacyLevel` | `mask` | `mask`, `mask-user-input` or `allow`: how much of what is on the page and typed into it is sent |
 | `actionNameAttribute` | `data-molesignal-name` | Attribute that names an action target (used with `allow`) |
 | `excludedUrls` | `[]` | String, RegExp or callback URL exclusions for requests |
 | `allowedTracingUrls` | same origin | Requests that receive and contribute trace context |
+| `traceSampleRate` | `100` | Percentage of the traces requests start that a back end is asked to keep (the W3C sampled flag) |
 | `enablePersistentQueue` | `true` | Recover unsent telemetry from IndexedDB after a reload |
+| `compressIntakeRequests` | `false` | Gzip the requests of events where the browser can |
+| `remoteConfiguration` | `false` | Read the sample rates, privacy level and the like the application's settings decide before starting |
+| `appUrl` | `site` | Where people open MoleSignal, for `getSessionReplayLink` |
+| `plugins` | `[]` | What extends the SDK, such as `reactPlugin()` |
 | `flushInterval`, `batchSize` | `5000`, `50` | When and how many events go in a request (batches are capped at 100) |
 | `maxQueueSize` | `1000` | Events kept while offline |
 | `retryBaseDelay`, `retryMaxDelay` | `1000`, `60000` | Exponential retry bounds; `Retry-After` is honored |
@@ -412,6 +494,10 @@ counts, with the drop reasons.
   and element selectors in vitals and long-task invokers are structural too.
   `allow` names actions from the name attribute, `aria-label`, `title` or text,
   and records richer selectors.
+  `mask-user-input` does the same with what is on the page, and masks what is typed into it in a
+  replay; `allow` also shows what is typed, but for passwords, e-mail addresses, telephone numbers and
+  fields marked for cards or one-time codes. Mark a part of a masked page `data-molesignal-allow` to
+  show its text, and `data-molesignal-mask` to mask it whatever the level.
 - Stack traces are sent as text and as structured frames; file names in them
   follow the URL rules above.
 - `clientToken` ships to the browser and must be treated as public. Never reuse
@@ -425,6 +511,15 @@ TypeScript declarations. Optional browser APIs (`PerformanceObserver`, long
 animation frames, `MutationObserver`, IndexedDB, cookies) degrade independently
 when unavailable. The end-to-end suite runs against Chromium, Firefox and
 WebKit.
+
+## Upgrading from 0.2
+
+- **`allow` shows what is typed.** `defaultPrivacyLevel: 'allow'` now records what is typed into a
+  field, but for passwords, e-mail addresses, telephone numbers and card or one-time-code fields. To
+  keep what `allow` did before, use `mask-user-input`.
+- **Node 24.** `engines.node` is `>=24`. npm warns on an older Node, and a package manager that
+  enforces `engines` refuses to install. What runs in the browser does not change.
+- **Server.** Logs, heatmaps and test traffic need a MoleSignal server that knows them.
 
 ## Upgrading from 0.1
 
@@ -475,7 +570,7 @@ npm run test:e2e         # builds, then runs Playwright on Chromium, Firefox and
 npm run build
 ```
 
-The unit tests run in Node with a small fake browser and need Node 22.3 or
+The unit tests run in Node with a small fake browser and need Node 24 or
 later (they use module mocking). The contract tests validate every event the SDK
 sends, in the unit and in the end-to-end suite, against `v1.schema.json` of the
 MoleSignal server, and compare the events with its `source: browser` fixtures.

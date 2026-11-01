@@ -210,8 +210,9 @@ export interface TraceContext {
   parentSpanId: string;
 }
 
-export function generateTraceparent(): string {
-  return `00-${randomHex(16)}-${randomHex(8)}-01`;
+/** A new W3C trace context; a back end that follows it keeps the trace when `sampled` says so. */
+export function generateTraceparent(sampled = true): string {
+  return `00-${randomHex(16)}-${randomHex(8)}-${sampled ? '01' : '00'}`;
 }
 
 export function parseTraceparent(value: string | null | undefined): TraceContext | undefined {

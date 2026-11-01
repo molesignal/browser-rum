@@ -1,4 +1,4 @@
-import type { RumContext, RumEvent, RumEventType } from './events.js';
+import type { RumContext, RumEvent, RumEventType, RumLogLevel } from './events.js';
 
 export type { RumContext } from './events.js';
 
@@ -64,7 +64,12 @@ export type RumBeforeSend = (event: RumEvent, context: BeforeSendContext) => boo
 
 export type UrlMatcher = string | RegExp | ((url: string) => boolean);
 
-export type PrivacyLevel = 'mask' | 'allow';
+/**
+ * `mask`: every text is masked, and action names and selectors say nothing a person wrote.
+ * `mask-user-input`: the text of the page shows; what is typed into a field does not.
+ * `allow`: fields show too, but for passwords, e-mail addresses, telephone numbers and card fields.
+ */
+export type PrivacyLevel = 'mask' | 'mask-user-input' | 'allow';
 
 /** Tracking starts only while consent is granted. */
 export type TrackingConsent = 'granted' | 'not-granted';
@@ -106,6 +111,47 @@ export interface RumSessionReplayConfiguration {
   recordCrossOriginIframes?: boolean;
 }
 
+/** A logger of the application: `molesignalRum.logger`, or one of `createLogger`. */
+export interface RumLogger {
+  debug(message: string, context?: RumContext, error?: unknown): void;
+  info(message: string, context?: RumContext, error?: unknown): void;
+  warn(message: string, context?: RumContext, error?: unknown): void;
+  error(message: string, context?: RumContext, error?: unknown): void;
+  /** What is below this level is left out. */
+  setLevel(level: RumLogLevel): void;
+}
+
+export interface RumLoggerOptions {
+  /** Which logger wrote a log, as `log.logger`. */
+  name?: string;
+  /** What is below this level is left out. Defaults to `debug`. */
+  level?: RumLogLevel;
+  /** Attributes every log of this logger has. */
+  context?: RumContext;
+}
+
+/** What a plugin is given once the SDK runs. */
+export interface RumPluginStart {
+  client: RumClient;
+}
+
+/** Something that extends the SDK, such as the integration with a router. */
+export interface RumPlugin {
+  name: string;
+  /** Before the SDK reads its configuration: a plugin may set what it needs in it. */
+  onInit?(configuration: RumInitConfiguration): void;
+  onStart?(start: RumPluginStart): void;
+}
+
+/** What an application's settings can decide for the SDK, read from the server at start. */
+export interface RumRemoteConfiguration {
+  sessionSampleRate?: number;
+  sessionReplaySampleRate?: number;
+  defaultPrivacyLevel?: PrivacyLevel;
+  trackUserInteractions?: boolean;
+  forwardConsoleLogs?: Array<'debug' | 'log' | 'info' | 'warn' | 'error'>;
+}
+
 export interface RumInitConfiguration {
   /**
    * Identifier of the MoleSignal RUM application the client token belongs to.
@@ -135,6 +181,11 @@ export interface RumInitConfiguration {
   sessionSampleRate?: number;
   /** Percentage of sampled sessions that record DOM replay. Defaults to 0. */
   sessionReplaySampleRate?: number;
+  /**
+   * Percentage of the traces requests start that a back end is asked to keep (the W3C sampled flag).
+   * The others still carry a trace context, so the request and its trace id stay joined. Defaults to 100.
+   */
+  traceSampleRate?: number;
   /** DOM recording and privacy controls for sampled session replay. */
   sessionReplay?: RumSessionReplayConfiguration;
 
@@ -148,6 +199,17 @@ export interface RumInitConfiguration {
   /** Start a new view when a page is restored from the back/forward cache. Defaults to false. */
   trackBfcacheViews?: boolean;
   trackAnonymousUser?: boolean;
+  /** Keep how far down the page each view goes. Defaults to true. */
+  trackScroll?: boolean;
+  /** Say what goes wrong in the SDK itself as logs of the application. Defaults to true. */
+  trackSdkErrors?: boolean;
+  /** Which console methods also write logs. Defaults to none. */
+  forwardConsoleLogs?: Array<'debug' | 'log' | 'info' | 'warn' | 'error'> | 'all';
+  /**
+   * The headers of a fetch or XHR to keep with its resource, by name. Credentials
+   * (`authorization`, `cookie` and the like) are never kept. Defaults to none.
+   */
+  trackResourceHeaders?: Array<string | RegExp>;
 
   /** URL query strings are removed by default because they commonly contain PII. */
   trackUrlQueryString?: boolean;
@@ -163,6 +225,18 @@ export interface RumInitConfiguration {
   maxQueueSize?: number;
   /** Persist unsent telemetry in IndexedDB. Defaults to true. */
   enablePersistentQueue?: boolean;
+  /** Gzip the requests of events where the browser can. Defaults to false. */
+  compressIntakeRequests?: boolean;
+  /**
+   * Read what the settings of the application decide from the server before starting, and let it
+   * replace the values given here. The SDK starts with the values given if the server does not
+   * answer in time. Defaults to false.
+   */
+  remoteConfiguration?: boolean;
+  /** Where people open MoleSignal, when it is not `site`. For `getSessionReplayLink`. */
+  appUrl?: string;
+  /** What extends the SDK. */
+  plugins?: RumPlugin[];
   /** Initial retry delay in milliseconds. Defaults to 1 second. */
   retryBaseDelay?: number;
   /** Maximum retry delay in milliseconds. Defaults to 60 seconds. */
@@ -271,11 +345,20 @@ export interface RumClient {
   addTiming(name: string, time?: number): void;
   addFeatureFlagEvaluation(key: string, value: unknown): void;
 
+  /** The logger of the application, which has no name of its own. */
+  readonly logger: RumLogger;
+  createLogger(options?: RumLoggerOptions): RumLogger;
+
   startView(nameOrOptions?: string | StartViewOptions, context?: RumContext): void;
   setViewName(name: string): void;
   setViewContext(context: RumContext): void;
   setViewContextProperty(key: string, value: unknown): void;
   getViewContext(): RumContext;
+  /**
+   * Says the current view has loaded now, in place of what the SDK measures. For pages that know
+   * better, such as one that shows a skeleton while its data arrives.
+   */
+  setViewLoadingTime(): void;
 
   startDurationVital(
     name: string,
@@ -292,6 +375,11 @@ export interface RumClient {
   stopSessionReplayRecording(): void;
   /** Ends the session now; the next user activity starts a new one. */
   stopSession(): void;
+  /**
+   * The address of the current session in MoleSignal, to put in a support ticket or a bug report.
+   * Undefined while no session is recorded.
+   */
+  getSessionReplayLink(): string | undefined;
 
   setTrackingConsent(consent: TrackingConsent): void;
   getTrackingConsent(): TrackingConsent;

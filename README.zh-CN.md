@@ -6,8 +6,7 @@ MoleSignal 官方浏览器端 Real User Monitoring SDK。它把页面视图、�
 
 [English](README.md)
 
-> **0.2.0 是不兼容升级。** SDK 现在使用 MoleSignal RUM 事件协议，不再写入
-> `/rum/sessions`、`/rum/actions`、`/rum/errors`。详见[从 0.1 升级](#从-01-升级)。
+> **0.3.0 改变了 `allow` 录制的内容，安装需要 Node 24。** 详见[从 0.2 升级](#从-02-升级)。
 
 ## 安装
 
@@ -16,6 +15,8 @@ npm install @molesignal/browser-rum
 ```
 
 也可以直接加载单文件浏览器包（见[脚本标签加载](#脚本标签加载)）。
+
+通过 npm 安装需要 Node 24 及以上。
 
 ## 快速开始
 
@@ -63,7 +64,7 @@ SDK 写入两个端点，均携带 `Authorization: Bearer <clientToken>`：
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.2.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.3.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
@@ -234,6 +235,70 @@ init({
 | 授权 | `setTrackingConsent`、`getTrackingConsent` |
 | 发送 | `flush`、`stop`、`getTransportStats` |
 
+## 日志
+
+日志写进 `rum_logs` 流，带着写下它时的会话和页面，所以在会话页和日志探索器里都能看到。只有你写日志或者要求转发控制台时才会发送。
+
+```ts
+import { molesignalRum } from '@molesignal/browser-rum';
+
+molesignalRum.logger.info('打开购物车', { items: 3 });
+
+const payments = molesignalRum.createLogger({ name: 'payments', level: 'warn', context: { provider: 'stripe' } });
+payments.error('支付被拒', { code: 402 }, error);
+
+// 同时转发页面写到控制台的内容。
+init({ /* … */ forwardConsoleLogs: ['warn', 'error'] });
+```
+
+`init` 之前写的日志会等到 `init`。应用不保留的会话也不留日志。
+
+## React
+
+`@molesignal/browser-rum/react` 把路由器的路由变成 SDK 的视图，按路由模式命名（`/orders/:id`，不是 `/orders/42`），并上报组件树抛出的错误。React 是可选的 peer 依赖。
+
+```tsx
+import { init } from '@molesignal/browser-rum';
+import { reactPlugin, RumErrorBoundary, trackReactRouter } from '@molesignal/browser-rum/react';
+
+init({ /* … */ plugins: [reactPlugin()] });
+trackReactRouter(router); // createBrowserRouter 创建的路由器；TanStack Router 用 trackTanStackRouter
+
+root.render(
+  <RumErrorBoundary fallback={<Oops />}>
+    <RouterProvider router={router} />
+  </RumErrorBoundary>,
+);
+```
+
+## 功能开关
+
+`addFeatureFlagEvaluation(key, value)` 把开关放到当前视图的事件上。跟随 LaunchDarkly 用 inspector，跟随 OpenFeature 用 `after` hook：
+
+```ts
+LDClient.initialize(id, user, {
+  inspectors: [{
+    type: 'flag-used',
+    name: 'molesignal',
+    method: (key, detail) => molesignalRum.addFeatureFlagEvaluation(key, detail.value),
+  }],
+});
+
+OpenFeature.addHooks({
+  after: (context, details) => molesignalRum.addFeatureFlagEvaluation(context.flagKey, details.value),
+});
+```
+
+## 测试驱动的页面
+
+会话默认是 `user` 类型，除非 SDK 启动前 `window.__MOLESIGNAL_TEST_CONTEXT__` 另有说明：MoleSignal 的浏览器拨测会设置它，测试运行也可以设置（Playwright 用 `page.addInitScript`）。
+
+```ts
+window.__MOLESIGNAL_TEST_CONTEXT__ = { type: 'ci_test', test_execution_id: 'run-1234' };
+```
+
+这样的会话不会被采样掉，应用的统计默认也不算它。SDK 把会话 ID 写到 `window.__MOLESIGNAL_RUM_SESSION__`。
+
 ## 会话回放
 
 回放默认关闭，可按采样率启用，或为当前会话手动开启：
@@ -255,8 +320,9 @@ rum.stopSessionReplayRecording();
 ```
 
 录制时按需加载 rrweb，记录 DOM 全量快照与增量变化，包括鼠标移动、点击、滚动、视口变化和
-媒体状态；可访问的样式表会内联。所有输入框与可编辑区域内容始终脱敏，`defaultPrivacyLevel:
-'mask'` 还会遮罩全部页面文本。可以用上述选择器阻止敏感子树、在允许普通文本时单独遮罩
+媒体状态；可访问的样式表会内联。`defaultPrivacyLevel: 'mask'` 遮罩全部页面文本和输入内容；
+`mask-user-input` 显示页面文本，遮罩输入内容和可编辑区域；`allow` 也显示输入内容，但密码、邮箱、
+电话以及标记为银行卡或一次性验证码的字段除外。给被遮罩页面的一部分加 `data-molesignal-allow` 可以显示它的文本。可以用上述选择器阻止敏感子树、在允许普通文本时单独遮罩
 指定区域，或忽略高噪声元素。字体、内联图片以及协作式跨域 iframe 默认关闭，因为它们会显著
 增大录制体积。会话正在录制时，view 会带上 `session.has_replay: true`。
 
@@ -312,10 +378,19 @@ allowedTracingUrls: [
 | `trackConsoleErrors` | `false` | 把 `console.error` 上报为错误 |
 | `trackAnonymousUser` | `true` | 创建持久化匿名用户 ID |
 | `trackUrlQueryString` | `false` | 在上报的 URL 中保留查询串 |
-| `defaultPrivacyLevel` | `mask` | `mask` 或 `allow`：操作名称、选择器和元素提示是否带页面文本与 id |
+| `trackScroll` | `true` | 记录每个视图往下看到多远 |
+| `trackResourceHeaders` | `[]` | 保留 fetch、XHR 的哪些请求头和响应头（名称或正则）；凭据从不保留 |
+| `forwardConsoleLogs` | `[]` | 哪些 console 方法同时写日志（`'all'`，或 `debug`、`log`、`info`、`warn`、`error` 的子集） |
+| `trackSdkErrors` | `true` | 把 SDK 自身的问题写成应用的日志，每次页面加载最多几条 |
+| `defaultPrivacyLevel` | `mask` | `mask`、`mask-user-input` 或 `allow`：页面内容和输入内容上报多少 |
+| `compressIntakeRequests` | `false` | 浏览器支持时 gzip 压缩事件请求 |
+| `remoteConfiguration` | `false` | 启动前读取应用设置决定的采样率、隐私级别等 |
+| `appUrl` | `site` | MoleSignal 的访问地址，给 `getSessionReplayLink` 用 |
+| `plugins` | `[]` | 扩展 SDK 的插件，比如 `reactPlugin()` |
 | `actionNameAttribute` | `data-molesignal-name` | 给操作目标命名的属性（配合 `allow`） |
 | `excludedUrls` | `[]` | 排除请求的字符串、RegExp 或回调 |
 | `allowedTracingUrls` | 同源 | 允许注入并读取 trace 上下文的请求 |
+| `traceSampleRate` | `100` | 请求发起的 trace 中，要求后端保留的百分比（W3C sampled 标志） |
 | `enablePersistentQueue` | `true` | 刷新后从 IndexedDB 恢复未发送数据 |
 | `flushInterval`、`batchSize` | `5000`、`50` | 发送时机与每次请求的事件数（上限 100） |
 | `maxQueueSize` | `1000` | 离线时保留的事件数 |
@@ -381,6 +456,12 @@ init({
 `PerformanceObserver`、长动画帧、`MutationObserver`、IndexedDB、cookie 等可选浏览器能力在
 不可用时各自独立降级。端到端测试覆盖 Chromium、Firefox 与 WebKit。
 
+## 从 0.2 升级
+
+- **`allow` 会显示输入内容。** `defaultPrivacyLevel: 'allow'` 现在会录制输入框里的内容，但密码、邮箱、电话、银行卡和一次性验证码字段除外。要保持 `allow` 以前的行为，请改用 `mask-user-input`。
+- **Node 24。** `engines.node` 是 `>=24`。Node 版本更低时 npm 会警告，强制检查 `engines` 的包管理器会拒绝安装。在浏览器里运行的部分没有变化。
+- **服务端。** 日志、热力图和测试流量需要支持它们的 MoleSignal 服务端。
+
 ## 从 0.1 升级
 
 0.2.0 把 SDK 迁移到 MoleSignal RUM 事件协议，没有兼容模式。
@@ -421,7 +502,7 @@ npm run test:e2e         # 构建后用 Playwright 在 Chromium、Firefox、WebK
 npm run build
 ```
 
-单元测试在 Node 中借助一个小型假浏览器环境运行，需要 Node 22.3 及以上（使用了模块 mock）。
+单元测试在 Node 中借助一个小型假浏览器环境运行，需要 Node 24 及以上（使用了模块 mock）。
 契约测试会把 SDK 发出的每条事件（单元测试与端到端测试里都是）用 MoleSignal 服务端的
 `v1.schema.json` 校验，并与其中 `source: browser` 的夹具对比形状。契约目录由环境变量
 `MOLESIGNAL_CONTRACTS` 指定（默认 `../molesignal/contracts/rum/events`），找不到时这些测试会被

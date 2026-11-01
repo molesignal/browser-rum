@@ -85,10 +85,20 @@ export class ReplayRecorder {
         maskTextSelector:
           this.config.defaultPrivacyLevel === 'mask'
             ? '*'
-            : `${this.config.sessionReplay.maskTextSelector}, [contenteditable]:not([contenteditable="false"])`,
-        // Inputs, including passwords, are never sent as clear text even when
-        // the broader privacy level allows visible page text.
-        maskAllInputs: true,
+            : this.config.defaultPrivacyLevel === 'mask-user-input'
+              ? `${this.config.sessionReplay.maskTextSelector}, [contenteditable]:not([contenteditable="false"])`
+              : this.config.sessionReplay.maskTextSelector,
+        // A part of a masked page a team has looked at and is happy to show says so.
+        maskTextFn: maskedTextOf(
+          `${this.config.sessionReplay.maskTextSelector}, [contenteditable]:not([contenteditable="false"])`,
+        ),
+        // Only `allow` shows what is typed, and never what is a password, an address or a card.
+        maskAllInputs: this.config.defaultPrivacyLevel !== 'allow',
+        maskInputOptions:
+          this.config.defaultPrivacyLevel === 'allow'
+            ? { password: true, email: true, tel: true }
+            : undefined,
+        maskInputFn: this.config.defaultPrivacyLevel === 'allow' ? maskedInput : undefined,
         slimDOMOptions: 'all',
         inlineStylesheet: true,
         inlineImages: this.config.sessionReplay.inlineImages,
@@ -132,6 +142,33 @@ export class ReplayRecorder {
       reportInternalError(this.config.onError, error, 'RUM replay recorder failed to stop');
     }
   }
+}
+
+const ALLOW_SELECTOR = '[data-molesignal-allow]';
+
+/**
+ * Masks text, but in a part marked as allowed. What is marked as masked stays masked in there too,
+ * and so does what a person writes.
+ */
+function maskedTextOf(stillMasked: string): (text: string, element: HTMLElement | null) => string {
+  return (text, element) => {
+    let allowed = false;
+    try {
+      allowed = Boolean(element?.closest?.(ALLOW_SELECTOR)) && !element?.closest?.(stillMasked);
+    } catch {
+      // A selector the browser cannot read masks, as anything in doubt does.
+    }
+    return allowed ? text : text.replace(/\S/g, '*');
+  };
+}
+
+/** With `allow`, a field that holds a card or a one-time code, or asks to be masked, stays masked. */
+function maskedInput(text: string, element: HTMLElement): string {
+  const autocomplete = element.getAttribute?.('autocomplete') ?? '';
+  const sensitive =
+    /^(cc-|one-time-code|current-password|new-password)/.test(autocomplete) ||
+    element.closest?.('[data-molesignal-mask]');
+  return sensitive ? '*'.repeat(text.length) : text;
 }
 
 const URL_FIELDS = new Set([

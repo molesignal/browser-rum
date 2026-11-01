@@ -16,7 +16,8 @@ export type RumEventType =
   | 'error'
   | 'resource'
   | 'long_task'
-  | 'vital';
+  | 'vital'
+  | 'log';
 
 export interface RumCount {
   count: number;
@@ -108,6 +109,13 @@ export interface RumViewBody extends RumViewReference {
   load_event?: number;
   network_settled_time?: number;
   interaction_to_next_view_time?: number;
+  /** How far down the page the view went, in CSS pixels. */
+  scroll?: {
+    max_depth?: number;
+    max_depth_scroll_top?: number;
+    max_scroll_height?: number;
+    max_scroll_height_time?: number;
+  };
   performance?: RumViewPerformance;
   custom_timings?: Record<string, number>;
   action?: RumCount;
@@ -121,8 +129,20 @@ export interface RumActionBody {
   id: string;
   type: 'custom' | 'click';
   loading_time?: number;
-  target?: { name?: string; selector?: string; width?: number; height?: number };
+  target?: {
+    name?: string;
+    selector?: string;
+    /** Where the element stands in the page, by tags and places only. */
+    path?: string;
+    width?: number;
+    height?: number;
+    /** Where in the element the click landed. */
+    offset?: { x: number; y: number };
+  };
+  /** Where in the window the click landed. */
   position?: { x: number; y: number };
+  /** Where on the page the click landed, wherever it was scrolled to. */
+  page_position?: { x: number; y: number };
   name_source?:
     | 'custom_attribute'
     | 'mask_placeholder'
@@ -225,6 +245,8 @@ export interface RumResourceBody {
   download?: RumResourcePhase;
   trace_id?: string;
   span_id?: string;
+  request?: { headers?: Record<string, string> };
+  response?: { headers?: Record<string, string> };
 }
 
 export interface RumLongTaskScript {
@@ -267,6 +289,17 @@ export interface RumVitalBody {
   duration: number;
 }
 
+export type RumLogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface RumLogBody {
+  id: string;
+  /** The name of the logger that wrote it. */
+  logger?: string;
+  origin?: 'logger' | 'console' | 'report' | 'sdk';
+  error_type?: string;
+  stack?: string;
+}
+
 export interface RumEventBase {
   date: number;
   application: { id: string };
@@ -274,7 +307,17 @@ export interface RumEventBase {
   env?: string;
   version?: string;
   source: 'browser';
-  session: { id: string; type: 'user'; start?: number; has_replay?: boolean };
+  session: {
+    id: string;
+    /** `user` unless a test drives the page. */
+    type: 'user' | 'synthetics' | 'ci_test';
+    start?: number;
+    has_replay?: boolean;
+  };
+  /** The check that drives the page, on a session of type `synthetics`. */
+  synthetics?: { test_id?: string; result_id?: string; location_id?: string };
+  /** The test run that drives the page, on a session of type `ci_test`. */
+  ci_test?: { test_execution_id?: string };
   view: RumViewReference;
   /** On an event that is not an action: the action during which it happened. */
   action?: { id: string };
@@ -325,10 +368,18 @@ export interface RumVitalEvent extends RumEventBase {
   vital: RumVitalBody;
 }
 
+export interface RumLogEvent extends RumEventBase {
+  type: 'log';
+  level: RumLogLevel;
+  message: string;
+  log: RumLogBody;
+}
+
 export type RumEvent =
   | RumViewEvent
   | RumActionEvent
   | RumErrorEvent
   | RumResourceEvent
   | RumLongTaskEvent
-  | RumVitalEvent;
+  | RumVitalEvent
+  | RumLogEvent;

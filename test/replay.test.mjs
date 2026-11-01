@@ -13,10 +13,11 @@ const skip = moduleMocking
   : 'module mocking is unavailable (run node with --experimental-test-module-mocks)';
 
 function mockRrweb(t) {
-  const state = { emit: undefined, started: 0, stopped: 0 };
+  const state = { emit: undefined, started: 0, stopped: 0, options: undefined };
   t.mock.module('@rrweb/record', {
     exports: {
       record(options) {
+        state.options = options;
         state.emit = options.emit;
         state.started += 1;
         return () => {
@@ -192,4 +193,66 @@ test('replay can be started and stopped on demand and stops with the session', {
   } finally {
     browser.restore();
   }
+});
+
+/** An element for the masking of text: which of the selectors it is inside of. */
+function inside(...selectors) {
+  return { closest: (selector) => (selectors.some((name) => selector.includes(name)) ? {} : null) };
+}
+
+async function recordingWith(t, rrweb, privacy) {
+  const browser = installBrowser();
+  browser.document.documentElement = {};
+  t.after(() => browser.restore());
+  const recorder = recordRequests(t);
+  initRum(
+    quietConfiguration({
+      sessionReplaySampleRate: 100,
+      defaultPrivacyLevel: privacy,
+      replayFlushInterval: 60_000,
+      transport: recorder.transport,
+    }),
+  );
+  await until(() => rrweb.emit, 'rrweb should start recording a sampled session');
+  return rrweb.options;
+}
+
+test('mask masks the page and what is typed, but for a part marked as allowed', { skip }, async (t) => {
+  const options = await recordingWith(t, mockRrweb(t), 'mask');
+
+  assert.equal(options.maskTextSelector, '*');
+  assert.equal(options.maskAllInputs, true);
+  assert.equal(options.maskTextFn('Ada Lovelace', inside()), '*** ********');
+  assert.equal(options.maskTextFn('Pricing', inside('[data-molesignal-allow]')), 'Pricing');
+  // What is marked as masked, or written by a person, stays so inside an allowed part.
+  assert.equal(options.maskTextFn('Ada', inside('[data-molesignal-allow]', '[data-molesignal-mask]')), '***');
+  assert.equal(options.maskTextFn('Ada', inside('[data-molesignal-allow]', '[contenteditable]')), '***');
+  assert.equal(options.maskTextFn('Ada', null), '***');
+});
+
+test('mask-user-input shows the page and masks what is typed', { skip }, async (t) => {
+  const options = await recordingWith(t, mockRrweb(t), 'mask-user-input');
+
+  assert.notEqual(options.maskTextSelector, '*');
+  assert.match(options.maskTextSelector, /contenteditable/);
+  assert.equal(options.maskAllInputs, true);
+  assert.equal(options.maskInputFn, undefined);
+});
+
+test('allow shows what is typed, but for what is sensitive', { skip }, async (t) => {
+  const options = await recordingWith(t, mockRrweb(t), 'allow');
+
+  assert.doesNotMatch(options.maskTextSelector, /contenteditable/);
+  assert.equal(options.maskAllInputs, false);
+  assert.deepEqual(options.maskInputOptions, { password: true, email: true, tel: true });
+
+  const field = (autocomplete, masked = false) => ({
+    getAttribute: () => autocomplete,
+    closest: () => (masked ? {} : null),
+  });
+
+  assert.equal(options.maskInputFn('blue', field('')), 'blue');
+  assert.equal(options.maskInputFn('4242', field('cc-number')), '****');
+  assert.equal(options.maskInputFn('123456', field('one-time-code')), '******');
+  assert.equal(options.maskInputFn('blue', field('', true)), '****');
 });

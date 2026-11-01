@@ -2,6 +2,8 @@ import type { RumActionBody } from './events.js';
 import type { PrivacyLevel } from './types.js';
 import { truncate } from './utils.js';
 
+const MAX_PATH_CHARS = 2_048;
+
 /**
  * A CSS-like selector for an element. With the `mask` privacy level it only
  * describes the structure (tag and position among siblings of the same tag):
@@ -36,6 +38,22 @@ export function elementSelector(
   return structuralSelector(element, tag);
 }
 
+/**
+ * Where an element stands in the page, by tags and places among siblings of the same tag, from the
+ * body down: enough to find it again in a recording of the page, and nothing a person wrote. A page
+ * nested too deep to say it in this many characters has none.
+ */
+export function elementPath(element: Element): string | undefined {
+  const steps: string[] = [];
+  let current: Element | null = element;
+  while (current && current !== document.documentElement) {
+    steps.unshift(structuralSelector(current, current.tagName.toLowerCase()));
+    current = current.parentElement;
+  }
+  const path = steps.join('>');
+  return path.length <= MAX_PATH_CHARS ? path : undefined;
+}
+
 /** The label of an action target, and where it came from. */
 export function actionTargetName(
   element: HTMLElement,
@@ -43,7 +61,7 @@ export function actionTargetName(
   privacyLevel: PrivacyLevel,
   actionNameAttribute: string,
 ): { name: string; source: NonNullable<RumActionBody['name_source']> } {
-  if (privacyLevel === 'allow') {
+  if (privacyLevel !== 'mask') {
     const explicit = element.getAttribute(actionNameAttribute)?.trim();
     if (explicit) return { name: truncate(explicit, 160), source: 'custom_attribute' };
     const standard =

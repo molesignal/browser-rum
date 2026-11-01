@@ -27,6 +27,9 @@ export interface RequestRecord {
   failed?: boolean;
   /** The request was cancelled by the application. */
   aborted?: boolean;
+  /** The headers asked for by `trackResourceHeaders`. */
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
   /** The name of the error thrown by `fetch`, such as `TypeError`. */
   errorName?: string;
   errorMessage?: string;
@@ -55,6 +58,11 @@ export function instrumentNetwork(
   };
 }
 
+/** Whether the trace a request starts is one the back end is asked to keep. */
+function traceIsSampled(hooks: InstrumentationHooks): boolean {
+  return Math.random() * 100 < hooks.config.traceSampleRate;
+}
+
 function instrumentFetch(hooks: InstrumentationHooks, listener: RequestListener): Cleanup {
   if (typeof window.fetch !== 'function') return () => undefined;
   const originalFetch = window.fetch;
@@ -74,7 +82,7 @@ function instrumentFetch(hooks: InstrumentationHooks, listener: RequestListener)
     let tracedInput = input;
     let tracedInit = init;
     if (traced && !requestTraceparent) {
-      requestTraceparent = generateTraceparent();
+      requestTraceparent = generateTraceparent(traceIsSampled(hooks));
       [tracedInput, tracedInit] = injectFetchTraceparent(input, init, requestTraceparent);
     }
 
@@ -94,6 +102,8 @@ function instrumentFetch(hooks: InstrumentationHooks, listener: RequestListener)
       record.status = response.status;
       record.statusText = response.statusText || undefined;
       if (traced) record.trace = responseTraceContext(response, requestTraceparent);
+      record.requestHeaders = keptHeaders(hooks, requestHeaderPairs(input, init));
+      record.responseHeaders = keptHeaders(hooks, [...response.headers.entries()]);
       listener.finished(record);
       return response;
     } catch (error) {
@@ -173,7 +183,7 @@ function instrumentXhr(hooks: InstrumentationHooks, listener: RequestListener): 
 
     const traced = hooks.config.trackResources && hooks.shouldReadTrace(state.url);
     if (traced && !state.traceparent) {
-      state.traceparent = generateTraceparent();
+      state.traceparent = generateTraceparent(traceIsSampled(hooks));
       try {
         originalSetRequestHeader.call(this, 'traceparent', state.traceparent);
       } catch {
@@ -205,6 +215,7 @@ function instrumentXhr(hooks: InstrumentationHooks, listener: RequestListener): 
         record.aborted = aborted;
         record.failed = this.status === 0;
         if (traced) record.trace = xhrTraceContext(this, state.traceparent);
+        record.responseHeaders = keptHeaders(hooks, xhrResponseHeaders(this));
         listener.finished(record);
       },
       { once: true },
@@ -223,6 +234,60 @@ function instrumentXhr(hooks: InstrumentationHooks, listener: RequestListener): 
     }
     if (prototype.send === wrappedSend) prototype.send = originalSend;
   };
+}
+
+/** Headers that hold credentials are never kept, whatever is asked for. */
+const SECRET_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'x-api-key',
+  'x-auth-token',
+  'x-csrf-token',
+]);
+
+/** The headers `trackResourceHeaders` asks for, with their names in lower case. */
+function keptHeaders(
+  hooks: InstrumentationHooks,
+  pairs: Array<[string, string]>,
+): Record<string, string> | undefined {
+  const asked = hooks.config.trackResourceHeaders;
+  if (asked.length === 0) return undefined;
+  const kept: Record<string, string> = {};
+  for (const [rawName, value] of pairs) {
+    const name = rawName.toLowerCase();
+    if (SECRET_HEADERS.has(name)) continue;
+    if (asked.some((pattern) => (typeof pattern === 'string' ? pattern.toLowerCase() === name : pattern.test(name)))) {
+      kept[name] = value.slice(0, 1_024);
+    }
+  }
+  return Object.keys(kept).length > 0 ? kept : undefined;
+}
+
+function requestHeaderPairs(input: RequestInfo | URL, init?: RequestInit): Array<[string, string]> {
+  try {
+    const headers = new Headers(
+      init?.headers ?? (typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined),
+    );
+    return [...headers.entries()];
+  } catch {
+    return [];
+  }
+}
+
+function xhrResponseHeaders(request: XMLHttpRequest): Array<[string, string]> {
+  try {
+    return (request.getAllResponseHeaders() ?? '')
+      .split(/\r?\n/)
+      .map((line): [string, string] => {
+        const at = line.indexOf(':');
+        return [line.slice(0, at).trim(), line.slice(at + 1).trim()];
+      })
+      .filter(([name]) => name.length > 0);
+  } catch {
+    return [];
+  }
 }
 
 /** The trace of a finished XHR: the response, else `Server-Timing`, else what was sent. */

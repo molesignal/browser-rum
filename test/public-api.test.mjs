@@ -154,7 +154,7 @@ test('events carry the common attributes of the MoleSignal event contract', asyn
     const [request] = recorder.requests;
     assert.equal(request.headers.authorization, `Bearer ${CLIENT_TOKEN}`);
     assert.equal(request.headers['content-type'], 'application/json');
-    assert.match(request.headers['x-molesignal-rum'], /^browser-rum\/\d/);
+    assert.match(request.headers['x-molesignal-rum-sdk'], /^browser-rum\/\d/);
 
     const action = recorder.events('action')[0];
     assert.equal(action.source, 'browser');
@@ -171,7 +171,7 @@ test('events carry the common attributes of the MoleSignal event contract', asyn
     assert.deepEqual(action.usr, { id: 'user-42', plan: 'pro' });
     assert.deepEqual(action.account, { id: 'acme' });
     assert.equal(action.sdk.name, 'molesignal-browser-rum');
-    assert.equal(action.sdk.version, '0.2.0');
+    assert.equal(action.sdk.version, '0.3.0');
     assert.equal(action.sdk.session_sample_rate, 100);
     assert.equal(action.sdk.replay_sample_rate, 20);
     assert.equal(action.display.viewport.width, 1440);
@@ -339,6 +339,42 @@ test('fetch becomes a resource event with W3C trace context', async (t) => {
 
     const view = recorder.views()[0];
     assert.equal(view.view.resource.count, 1);
+    await client.stop();
+  } finally {
+    browser.restore();
+  }
+});
+
+test('traceSampleRate says which new traces a back end is asked to keep', async (t) => {
+  const outbound = [];
+  const browser = installBrowser({
+    fetch: async (input, init) => {
+      outbound.push({ input, init });
+      return new Response(null, { status: 204 });
+    },
+  });
+  try {
+    const recorder = recordRequests(t);
+    const client = initRum(
+      quietConfiguration({
+        allowedTracingUrls: ['https://api.example.test/'],
+        trackResources: true,
+        traceSampleRate: 0,
+        transport: recorder.transport,
+      }),
+    );
+
+    await window.fetch('https://api.example.test/orders');
+    await client.flush();
+
+    const traceparent = new Headers(outbound[0].init.headers).get('traceparent');
+
+    assert.match(traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-00$/);
+    assert.equal(
+      recorder.events('resource').find((event) => event.resource.url === 'https://api.example.test/orders').resource.trace_id,
+      traceparent.split('-')[1],
+      'the request and its trace stay joined',
+    );
     await client.stop();
   } finally {
     browser.restore();
