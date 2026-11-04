@@ -489,7 +489,7 @@ export class EventTransport {
       const result = await this.send(
         'replay',
         JSON.stringify({
-          session_id: segment.sessionId,
+          sessionId: segment.sessionId,
           seq: segment.seq,
           events: segment.events,
           // A segment has no event to say where its session runs, and what the application keeps
@@ -498,7 +498,7 @@ export class EventTransport {
           env: this.config.env,
           version: this.config.version,
           // A session a test drives is kept whatever the application samples.
-          session_type: this.config.testContext?.type,
+          sessionType: this.config.testContext?.type,
         }),
         keepalive,
       );

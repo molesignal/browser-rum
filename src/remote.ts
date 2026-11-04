@@ -39,24 +39,24 @@ function readRemote(answer: unknown): RumRemoteConfiguration {
   if (!answer || typeof answer !== 'object') return {};
   const said = answer as Record<string, unknown>;
   const remote: RumRemoteConfiguration = {};
-  if (typeof said.session_sample_rate === 'number') {
-    remote.sessionSampleRate = said.session_sample_rate;
+  if (typeof said.sessionSampleRate === 'number') {
+    remote.sessionSampleRate = said.sessionSampleRate;
   }
-  if (typeof said.session_replay_sample_rate === 'number') {
-    remote.sessionReplaySampleRate = said.session_replay_sample_rate;
+  if (typeof said.sessionReplaySampleRate === 'number') {
+    remote.sessionReplaySampleRate = said.sessionReplaySampleRate;
   }
   if (
-    said.default_privacy_level === 'mask' ||
-    said.default_privacy_level === 'mask-user-input' ||
-    said.default_privacy_level === 'allow'
+    said.defaultPrivacyLevel === 'mask' ||
+    said.defaultPrivacyLevel === 'mask-user-input' ||
+    said.defaultPrivacyLevel === 'allow'
   ) {
-    remote.defaultPrivacyLevel = said.default_privacy_level;
+    remote.defaultPrivacyLevel = said.defaultPrivacyLevel;
   }
-  if (typeof said.track_user_interactions === 'boolean') {
-    remote.trackUserInteractions = said.track_user_interactions;
+  if (typeof said.trackUserInteractions === 'boolean') {
+    remote.trackUserInteractions = said.trackUserInteractions;
   }
-  if (Array.isArray(said.forward_console_logs)) {
-    remote.forwardConsoleLogs = said.forward_console_logs as RumRemoteConfiguration['forwardConsoleLogs'];
+  if (Array.isArray(said.forwardConsoleLogs)) {
+    remote.forwardConsoleLogs = said.forwardConsoleLogs as RumRemoteConfiguration['forwardConsoleLogs'];
   }
   return remote;
 }

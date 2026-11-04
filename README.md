@@ -52,7 +52,7 @@ The SDK writes to two endpoints, both with `Authorization: Bearer <clientToken>`
 | Endpoint | Body |
 | --- | --- |
 | `POST {site}/api/v1/rum/events` | A JSON array of events (at most 100 per request). The answer is `{ "accepted": n, "rejected": [{ "index": i, "reason": "…" }] }`. |
-| `POST {site}/api/v1/rum/replay` | rrweb segments `{ session_id, seq, events, service, env, version }`, only for sessions that record replay. `env` and `version` are left out when they are not set. They tell the server where the session runs, which the retention filters of the application may look at. |
+| `POST {site}/api/v1/rum/replay` | rrweb segments `{ sessionId, seq, events, service, env, version }`, only for sessions that record replay. `env` and `version` are left out when they are not set. They tell the server where the session runs, which the retention filters of the application may look at. |
 
 `site` may be an origin, or end in `/api`, `/api/v1` or `/api/v1/rum`.
 

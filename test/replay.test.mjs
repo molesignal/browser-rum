@@ -66,8 +66,8 @@ test('sampled replay uploads ordered segments and the view says the session has 
 
     const [first] = recorder.replay();
     assert.equal(recorder.requests.find((request) => request.kind === 'replay').url, 'https://rum.example.test/api/v1/rum/replay');
-    assert.match(first.session_id, /^[0-9a-f-]{36}$/);
-    assert.equal(first.session_id, recorder.events('view')[0].session.id);
+    assert.match(first.sessionId, /^[0-9a-f-]{36}$/);
+    assert.equal(first.sessionId, recorder.events('view')[0].session.id);
     assert.equal(first.seq, 1);
     assert.equal(first.service, 'unit-app', 'the service is the application when none is given');
     assert.equal('env' in first, false, 'a label that is not set is left out');

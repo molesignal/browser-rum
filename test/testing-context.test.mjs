@@ -125,7 +125,7 @@ test('what is decided on the server replaces what the page gave, and calls wait 
   const browser = installBrowser({
     fetch: async (input) => {
       if (String(input).endsWith('/api/v1/rum/config')) {
-        return new Response(JSON.stringify({ session_sample_rate: 100, default_privacy_level: 'allow', forward_console_logs: ['warn'] }), { status: 200 });
+        return new Response(JSON.stringify({ sessionSampleRate: 100, defaultPrivacyLevel: 'allow', forwardConsoleLogs: ['warn'] }), { status: 200 });
       }
 
       return new Response('{}', { status: 200 });

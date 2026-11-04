@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- The remote configuration and the replay segments speak camelCase, as the rest of the MoleSignal
+  API does: `remoteConfiguration` reads `sessionSampleRate`, `sessionReplaySampleRate`,
+  `defaultPrivacyLevel`, `trackUserInteractions` and `forwardConsoleLogs`, and a segment sends
+  `sessionId` and `sessionType`. It needs a MoleSignal server that speaks them; the events keep
+  their fields.
+
 ## 0.4.0
 
 ### Breaking changes

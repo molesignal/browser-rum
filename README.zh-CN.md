@@ -47,7 +47,7 @@ SDK 写入两个端点，均携带 `Authorization: Bearer <clientToken>`：
 | 端点 | 请求体 |
 | --- | --- |
 | `POST {site}/api/v1/rum/events` | 事件 JSON 数组（每次最多 100 条）。应答为 `{ "accepted": n, "rejected": [{ "index": i, "reason": "…" }] }`。 |
-| `POST {site}/api/v1/rum/replay` | rrweb 分段 `{ session_id, seq, events, service, env, version }`，仅记录回放的会话才会发送；`env`、`version` 未设置时不带。服务端靠它们知道会话在哪里运行，应用的保留过滤器可能按它们决定是否保留。 |
+| `POST {site}/api/v1/rum/replay` | rrweb 分段 `{ sessionId, seq, events, service, env, version }`，仅记录回放的会话才会发送；`env`、`version` 未设置时不带。服务端靠它们知道会话在哪里运行，应用的保留过滤器可能按它们决定是否保留。 |
 
 `site` 可以是源站地址，也可以以 `/api`、`/api/v1` 或 `/api/v1/rum` 结尾。
 
