@@ -64,7 +64,7 @@ SDK 写入两个端点，均携带 `Authorization: Bearer <clientToken>`：
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.4.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.5.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({

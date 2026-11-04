@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { getRum, init, initRum, molesignalRum } from '../dist/index.js';
@@ -171,7 +172,7 @@ test('events carry the common attributes of the MoleSignal event contract', asyn
     assert.deepEqual(action.usr, { id: 'user-42', plan: 'pro' });
     assert.deepEqual(action.account, { id: 'acme' });
     assert.equal(action.sdk.name, 'molesignal-browser-rum');
-    assert.equal(action.sdk.version, '0.4.0');
+    assert.equal(action.sdk.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
     assert.equal(action.sdk.session_sample_rate, 100);
     assert.equal(action.sdk.replay_sample_rate, 20);
     assert.equal(action.display.viewport.width, 1440);

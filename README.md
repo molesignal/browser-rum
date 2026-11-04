@@ -70,7 +70,7 @@ this snippet; callbacks passed to `onReady` wait until the script has loaded:
     script.async = 1;
     script.src = u;
     d.head.appendChild(script);
-  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.4.0/dist/molesignal-rum.js', 'MoleSignalRum');
+  })(window, document, 'script', 'https://cdn.jsdelivr.net/npm/@molesignal/browser-rum@0.5.0/dist/molesignal-rum.js', 'MoleSignalRum');
 
   MoleSignalRum.onReady(function () {
     MoleSignalRum.init({
